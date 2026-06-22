@@ -20,11 +20,12 @@ impl DapProtocol {
     }
 
     pub fn parse_info_response(data: &[u8]) -> Result<(u8, Vec<u8>)> {
-        if data.is_empty() {
-            return Err(Error::InvalidResponse("DAP_Info 响应为空".into()));
+        if data.len() < 2 {
+            return Err(Error::InvalidResponse("DAP_Info 响应过短".into()));
         }
-        let status = data[0];
-        let content = if data.len() > 1 { data[1..].to_vec() } else { vec![] };
+        // CMSIS-DAP 响应格式: [命令回显(0x00), 状态, 内容...]
+        let status = data[1];
+        let content = if data.len() > 2 { data[2..].to_vec() } else { vec![] };
         Ok((status, content))
     }
 
@@ -36,10 +37,12 @@ impl DapProtocol {
     }
 
     pub fn parse_connect_response(data: &[u8]) -> Result<u8> {
-        if data.is_empty() {
-            return Err(Error::InvalidResponse("DAP_Connect 响应为空".into()));
+        if data.len() < 2 {
+            return Err(Error::InvalidResponse("DAP_Connect 响应过短".into()));
         }
-        Ok(data[0])
+        // CMSIS-DAP 响应格式: [命令回显(0x02), 端口值]
+        // 端口值: 0=未连接, 1=SWD, 2=JTAG
+        Ok(data[1])
     }
 
     // --------------------------------------------------------
@@ -52,10 +55,50 @@ impl DapProtocol {
     }
 
     pub fn parse_clock_response(data: &[u8]) -> Result<u8> {
-        if data.is_empty() {
-            return Err(Error::InvalidResponse("DAP_SWJ_Clock 响应为空".into()));
+        if data.len() < 2 {
+            return Err(Error::InvalidResponse("DAP_SWJ_Clock 响应过短".into()));
         }
-        Ok(data[0])
+        // CMSIS-DAP 响应格式: [命令回显(0x11), 状态(0=成功)]
+        Ok(data[1])
+    }
+
+    // --------------------------------------------------------
+    // DAP_SWJ_PINS (控制 nRESET/SWCLK/SWDIO 引脚电平)
+    // --------------------------------------------------------
+    /// 构建 DAP_SWJ_PINS 请求
+    /// mask: 要修改的引脚位 (bit 0=SWCLK, bit 1=SWDIO, bit 2=nRESET)
+    /// value: 引脚电平值 (1=高, 0=低)
+    /// wait_us: 设置后等待的微秒数
+    pub fn build_pins_request(&self, mask: u8, value: u8, wait_us: u32) -> Vec<u8> {
+        let mut cmd = vec![DAP_SWJ_PINS, mask, value];
+        cmd.extend_from_slice(&wait_us.to_le_bytes());
+        cmd
+    }
+
+    pub fn parse_pins_response(data: &[u8]) -> Result<u8> {
+        if data.len() < 2 {
+            return Err(Error::InvalidResponse("DAP_SWJ_PINS 响应过短".into()));
+        }
+        Ok(data[1]) // 引脚状态
+    }
+
+    // --------------------------------------------------------
+    // DAP_SWJ_Sequence
+    // --------------------------------------------------------
+    /// 构建 DAP_SWJ_Sequence 请求
+    /// count 是比特数（不是字节数）！data.len() * 8 = 总比特数
+    pub fn build_swj_sequence_request(&self, data: &[u8]) -> Vec<u8> {
+        let bit_count = (data.len() * 8).min(256) as u8; // 最大 256 位
+        let mut cmd = vec![DAP_SWJ_SEQUENCE, bit_count];
+        cmd.extend_from_slice(data);
+        cmd
+    }
+
+    pub fn parse_swj_sequence_response(data: &[u8]) -> Result<u8> {
+        if data.len() < 2 {
+            return Err(Error::InvalidResponse("DAP_SWJ_Sequence 响应过短".into()));
+        }
+        Ok(data[1])
     }
 
     // --------------------------------------------------------
@@ -77,18 +120,19 @@ impl DapProtocol {
     }
 
     /// 解析 DAP_Transfer 响应
+    /// CMSIS-DAP v2 格式: [命令回显(0x05), 计数, 状态, 数据(每读操作4字节)...]
     pub fn parse_transfer_response(data: &[u8]) -> Result<TransferResponse> {
-        if data.len() < 2 {
+        if data.len() < 3 {
             return Err(Error::InvalidResponse(format!(
                 "DAP_Transfer 响应过短: {} 字节", data.len()
             )));
         }
 
-        let status = data[0];
-        let count = data[1];
+        let count = data[1];   // 处理的请求数
+        let status = data[2];  // 执行状态
 
-        // 读返回数据：每个读操作返回 4 字节
-        let data_bytes = &data[2..];
+        // 读返回数据：从 byte 3 开始，每 4 字节一个 u32
+        let data_bytes = &data[3..];
         let num_values = data_bytes.len() / 4;
         let mut values = Vec::with_capacity(num_values);
 
@@ -109,9 +153,11 @@ impl DapProtocol {
         requests: &[TransferRequest],
     ) -> Result<TransferResponse> {
         let cmd = self.build_transfer_request(requests);
+        log::debug!("DAP_Transfer 请求: {:02X?}", cmd);
         usb.write(&cmd)?;
         let mut buf = vec![0u8; 1024];
         let n = usb.read(&mut buf)?;
+        log::info!("<<< DAP_Transfer 响应 ({} 字节): {:02X?}", n, &buf[..n]);
         DapProtocol::parse_transfer_response(&buf[..n])
     }
 

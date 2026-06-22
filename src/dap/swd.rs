@@ -52,22 +52,33 @@ impl SwdLink {
         // 2. SWD 连接
         self.swd_connect()?;
 
-        // 3. 设置 SWD 时钟（从低到高自动检测）
-        let clock = self.auto_detect_clock()?;
+        // 3. 设置 SWD 时钟（AC7840X 先用保守的 1MHz）
+        let clock = 1_000_000u32;
+        let cmd = self.dap.build_clock_request(clock);
+        self.usb.write(&cmd)?;
+        let mut buf = [0u8; 64];
+        let n = self.usb.read(&mut buf)?;
+        DapProtocol::parse_clock_response(&buf[..n])?;
         info!("SWD 时钟: {} MHz", clock as f32 / 1_000_000.0);
 
-        // 4. 读取 DPIDR
+        // 4. 硬件复位目标 MCU
+        self.hardware_reset()?;
+
+        // 5. SWD 线复位 + JTAG-to-SWD 切换
+        self.swd_line_reset()?;
+
+        // 6. 读取 DPIDR
         let dpidr = self.read_dpidr()?;
         info!("DPIDR = 0x{:08X}", dpidr);
 
-        // 5. 调试电源上电
+        // 7. 调试电源上电
         self.power_up_debug()?;
 
-        // 6. 扫描 AP
+        // 8. 扫描 AP
         let ap_idr = self.scan_ap()?;
         info!("AP{} IDR = 0x{:08X}", self.ap_index, ap_idr);
 
-        // 7. 验证内存读取（读向量表地址 0x00000000）
+        // 9. 验证内存读取（读向量表地址 0x00000000）
         match self.read_memory(0x00000000) {
             Ok(v) => info!("验证读取 (0x00000000) = 0x{:08X} ✓", v),
             Err(e) => warn!("验证读取失败: {}", e),
@@ -84,11 +95,49 @@ impl SwdLink {
     /// SWD 连接
     fn swd_connect(&self) -> Result<()> {
         let cmd = self.dap.build_connect_request(CONNECT_MODE_SWD);
+        info!("DAP_Connect 请求: {:02X?}", cmd);
         self.usb.write(&cmd)?;
         let mut buf = [0u8; 64];
         let n = self.usb.read(&mut buf)?;
+        info!("DAP_Connect 响应 ({} 字节): {:02X?}", n, &buf[..n]);
         let mode = DapProtocol::parse_connect_response(&buf[..n])?;
         info!("DAP_Connect 返回: {}", mode);
+        Ok(())
+    }
+
+    /// 硬件复位目标 MCU (通过 DAP-Link 的 nRESET 引脚)
+    fn hardware_reset(&self) -> Result<()> {
+        info!("脉冲复位目标 MCU...");
+        // nRESET 引脚 = bit 2
+        // 1. 拉低 nRESET (mask=bit2, value=0) + 等待 10ms
+        let cmd = self.dap.build_pins_request(0x04, 0x00, 10000);
+        self.usb.write(&cmd)?;
+        let mut buf = [0u8; 64];
+        self.usb.read(&mut buf)?;
+
+        // 2. 拉高 nRESET (mask=bit2, value=bit2) + 等待 10ms
+        let cmd = self.dap.build_pins_request(0x04, 0x04, 10000);
+        self.usb.write(&cmd)?;
+        self.usb.read(&mut buf)?;
+
+        info!("复位完成");
+        Ok(())
+    }
+
+    /// SWD 线复位 (对 SW-DP 目标只需 Line Reset, 无需 JTAG-to-SWD 切换)
+    fn swd_line_reset(&self) -> Result<()> {
+        info!("发送 SWD Line Reset...");
+
+        // 对原生 SW-DP 目标，发送 50+ 个 TCK 时钟的 TMS=1
+        // 使 SW-DP 进入 Line Reset 状态
+        let seq = &[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // 56 bits
+                     0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]; // 56 bits (总共 112 bits)
+        let cmd = self.dap.build_swj_sequence_request(seq);
+        self.usb.write(&cmd)?;
+        let mut buf = [0u8; 64];
+        self.usb.read(&mut buf)?;
+
+        info!("SWD 线复位完成");
         Ok(())
     }
 

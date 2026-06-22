@@ -66,8 +66,8 @@ pub fn list_devices() -> Result<Vec<DeviceInfo>> {
             continue;
         }
 
-        // 检查是否为 Bulk 接口 (CMSIS-DAP v2 必须有 Bulk IN + Bulk OUT)
-        if !is_bulk_interface(&device)? {
+        // 检查是否为 CMSIS-DAP v2 接口 (Bulk 端点)
+        if !has_cmsis_dap_interface(&device)? {
             continue;
         }
 
@@ -98,25 +98,45 @@ fn is_known_device(vid: u16, pid: u16) -> bool {
     KNOWN_DEVICES.contains(&(vid, pid))
 }
 
-/// 检查设备是否有 Bulk 端点 (CMSIS-DAP v2 的特征)
-fn is_bulk_interface(device: &Device<Context>) -> Result<bool> {
+/// 已知的非 CMSIS-DAP 接口类
+const CDC_CLASS: u8 = 0x02;    // Communication Device Class
+const CDC_DATA_CLASS: u8 = 0x0A; // CDC Data Class
+const MSC_CLASS: u8 = 0x08;    // Mass Storage Class
+const HUB_CLASS: u8 = 0x09;    // Hub Class
+const AUDIO_CLASS: u8 = 0x01;  // Audio Class
+const HID_CLASS: u8 = 0x03;    // Human Interface Device
+
+/// 检查 interface 是否为 CMSIS-DAP v2 候选（Bulk 端点对 + 非已知类）
+fn is_cmsis_dap_candidate(alt: &rusb::InterfaceDescriptor) -> bool {
+    let class = alt.class_code();
+    // 排除已知的非 CMSIS-DAP 接口类
+    if class == CDC_CLASS || class == CDC_DATA_CLASS || class == MSC_CLASS
+        || class == HUB_CLASS || class == AUDIO_CLASS || class == HID_CLASS {
+        return false;
+    }
+    // 必须有 Bulk IN + Bulk OUT
+    let mut has_bulk_in = false;
+    let mut has_bulk_out = false;
+    for ep in alt.endpoint_descriptors() {
+        if ep.transfer_type() == rusb::TransferType::Bulk {
+            match ep.direction() {
+                rusb::Direction::In => has_bulk_in = true,
+                rusb::Direction::Out => has_bulk_out = true,
+            }
+        }
+    }
+    has_bulk_in && has_bulk_out
+}
+
+/// 检查设备是否有 CMSIS-DAP v2 接口
+fn has_cmsis_dap_interface(device: &Device<Context>) -> Result<bool> {
     let config = match device.config_descriptor(0) {
         Ok(c) => c,
         Err(_) => return Ok(false),
     };
     for interface in config.interfaces() {
         for alt in interface.descriptors() {
-            let mut has_bulk_in = false;
-            let mut has_bulk_out = false;
-            for ep in alt.endpoint_descriptors() {
-                if ep.transfer_type() == rusb::TransferType::Bulk {
-                    match ep.direction() {
-                        rusb::Direction::In => has_bulk_in = true,
-                        rusb::Direction::Out => has_bulk_out = true,
-                    }
-                }
-            }
-            if has_bulk_in && has_bulk_out {
+            if is_cmsis_dap_candidate(&alt) {
                 return Ok(true);
             }
         }
@@ -151,12 +171,13 @@ pub fn open_first_device() -> Result<rusb::DeviceHandle<Context>> {
             }
         }
 
-        if !is_bulk_interface(&device)? {
+        if !has_cmsis_dap_interface(&device)? {
             continue;
         }
 
         let handle = device.open()?;
-        let interface_num = find_bulk_interface_number(&device)?;
+        let interface_num = find_cmsis_dap_interface_number(&device)?;
+        log::info!("claiming interface {}", interface_num);
         handle.claim_interface(interface_num)?;
         return Ok(handle);
     }
@@ -164,22 +185,12 @@ pub fn open_first_device() -> Result<rusb::DeviceHandle<Context>> {
     Err(Error::DeviceNotFound)
 }
 
-/// 查找 Bulk 接口号
-fn find_bulk_interface_number(device: &Device<Context>) -> Result<u8> {
+/// 查找 CMSIS-DAP v2 接口号 (排除 CDC/MSC 等已知非 DAP 接口)
+fn find_cmsis_dap_interface_number(device: &Device<Context>) -> Result<u8> {
     let config = device.config_descriptor(0)?;
     for interface in config.interfaces() {
         for alt in interface.descriptors() {
-            let mut has_bulk_in = false;
-            let mut has_bulk_out = false;
-            for ep in alt.endpoint_descriptors() {
-                if ep.transfer_type() == rusb::TransferType::Bulk {
-                    match ep.direction() {
-                        rusb::Direction::In => has_bulk_in = true,
-                        rusb::Direction::Out => has_bulk_out = true,
-                    }
-                }
-            }
-            if has_bulk_in && has_bulk_out {
+            if is_cmsis_dap_candidate(&alt) {
                 return Ok(alt.interface_number());
             }
         }
@@ -187,13 +198,16 @@ fn find_bulk_interface_number(device: &Device<Context>) -> Result<u8> {
     Err(Error::DeviceNotFound)
 }
 
-/// 查找 Bulk 端点地址
+/// 查找 CMSIS-DAP v2 的 Bulk 端点地址
 pub fn find_bulk_endpoints(handle: &rusb::DeviceHandle<Context>) -> Result<(u8, u8)> {
     let device = handle.device();
     let config = device.config_descriptor(0)?;
 
     for interface in config.interfaces() {
         for alt in interface.descriptors() {
+            if !is_cmsis_dap_candidate(&alt) {
+                continue;
+            }
             let mut ep_out = 0u8;
             let mut ep_in = 0u8;
             for ep in alt.endpoint_descriptors() {
