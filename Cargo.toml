@@ -1,0 +1,13 @@
+﻿[package]
+name = "dap-sampler"
+version = "0.1.0"
+edition = "2021"
+description = "CMSIS-DAP v2 High-Speed Variable Sampler (P1)"
+
+[dependencies]
+rusb = "0.9"
+clap = { version = "4", features = ["derive"] }
+log = "0.4"
+env_logger = "0.11"
+anyhow = "1"
+thiserror = "1"
