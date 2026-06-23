@@ -2,11 +2,15 @@
 // DAP 命令码
 // ============================================================
 pub const DAP_INFO: u8 = 0x00;
+pub const DAP_LED: u8 = 0x01;        // DAP_HostStatus / DAP_LED
 pub const DAP_CONNECT: u8 = 0x02;
+pub const DAP_DISCONNECT: u8 = 0x03;
+pub const DAP_TRANSFER_CONFIGURE: u8 = 0x04;
+pub const DAP_TRANSFER: u8 = 0x05;
 pub const DAP_SWJ_CLOCK: u8 = 0x11;
 pub const DAP_SWJ_PINS: u8 = 0x10;
-pub const DAP_TRANSFER: u8 = 0x05;
 pub const DAP_SWJ_SEQUENCE: u8 = 0x12;
+pub const DAP_SWD_CONFIGURE: u8 = 0x13;
 
 // ============================================================
 // DAP_Info 请求 ID
@@ -28,29 +32,28 @@ pub const CONNECT_MODE_SWD: u8 = 0x01;   // 强制 SWD
 pub const CONNECT_MODE_JTAG: u8 = 0x02;  // 强制 JTAG
 
 /// DAP_Transfer 响应状态码（CMSIS-DAP v2 标准定义）
-pub const TRANSFER_OK: u8 = 0x00;
-pub const TRANSFER_WAIT: u8 = 0x01;
-pub const TRANSFER_FAULT: u8 = 0x02;
-pub const TRANSFER_PROTOCOL_ERR: u8 = 0x03;
+pub const TRANSFER_OK: u8 = 0x01;      // DAP_TRANSFER_OK
+pub const TRANSFER_WAIT: u8 = 0x02;    // DAP_TRANSFER_WAIT
+pub const TRANSFER_FAULT: u8 = 0x04;   // DAP_TRANSFER_FAULT
+pub const TRANSFER_PROTOCOL_ERR: u8 = 0x07; // SWD protocol error
 
 // ============================================================
-// SWD 请求字节编码（CMSIS-DAP 标准）
+// SWD 请求字节编码（CMSIS-DAP v2 标准，参考 Keil 抓包验证）
 //
-// Bit 0: RnW     (0=写, 1=读)
-// Bit 1: APnDP   (0=DP, 1=AP)
-// Bit 3: A2      (寄存器地址 bit 2, DAPLink 用 (req>>1)&0x0C 提取)
-// Bit 4: A3      (寄存器地址 bit 3)
+// Bit 0: APnDP   (0=DP, 1=AP)      ← 注意：APnDP 在 bit 0！
+// Bit 1: RnW     (0=写, 1=读)      ← 注意：RnW 在 bit 1！
+// Bit 2: A2      (寄存器地址 bit 2)
+// Bit 3: A3      (寄存器地址 bit 3)
 // ============================================================
 
-/// 构建 SWD 请求字节（已验证于 DAPLink 源码 DAP.c 的提取方式）
-/// DAPLink 使用 (request_value >> 1) & 0x0C 提取地址位，
-/// 所以 A2 必须在 bit 3, A3 必须在 bit 4
+/// 构建 SWD 请求字节（已通过 Keil USB 抓包验证）
+/// 位编码: [A3, A2, RnW, APnDP] 从高到低
 pub fn make_request(rnw: bool, apndp: bool, a2: bool, a3: bool) -> u8 {
     let mut val = 0u8;
-    if rnw { val |= 1 << 0; }
-    if apndp { val |= 1 << 1; }
-    if a2 { val |= 1 << 3; }
-    if a3 { val |= 1 << 4; }
+    if apndp { val |= 1 << 0; }  // APnDP 在 bit 0
+    if rnw { val |= 1 << 1; }    // RnW 在 bit 1
+    if a2 { val |= 1 << 2; }     // A2 在 bit 2
+    if a3 { val |= 1 << 3; }     // A3 在 bit 3
     val
 }
 
@@ -96,14 +99,14 @@ pub fn req_write_ap(addr: u8) -> u8 {
 }
 
 // ============================================================
-// DP CTRL/STAT 寄存器位定义
+// DP CTRL/STAT 寄存器位定义（ARM ADI v5 规范）
 // ============================================================
-pub const CSYSPWRUPREQ: u32 = 1 << 0;
-pub const CDBGPWRUPREQ: u32 = 1 << 1;
-pub const CSYSPWRUPACK: u32 = 1 << 2;
-pub const CDBGPWRUPACK: u32 = 1 << 3;
-pub const CDBGRSTREQ: u32 = 1 << 4;
-pub const CDBGRSTACK: u32 = 1 << 5;
+pub const CSYSPWRUPREQ: u32 = 1 << 30;   // System power-up request
+pub const CDBGPWRUPREQ: u32 = 1 << 28;   // Debug power-up request
+pub const CSYSPWRUPACK: u32 = 1 << 31;   // System power-up acknowledge (只读)
+pub const CDBGPWRUPACK: u32 = 1 << 29;   // Debug power-up acknowledge (只读)
+pub const CDBGRSTREQ: u32 = 1 << 26;     // Debug reset request
+pub const CDBGRSTACK: u32 = 1 << 27;     // Debug reset acknowledge (只读)
 
 // ============================================================
 // Transfer 请求/响应 结构体

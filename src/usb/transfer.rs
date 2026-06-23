@@ -32,7 +32,7 @@ impl BulkTransfer {
 
     /// Bulk 写（发送命令）
     pub fn write(&self, data: &[u8]) -> Result<usize> {
-        log::debug!("USB OUT: {} 字节", data.len());
+        log::debug!("USB OUT ({} 字节): {:02X?}", data.len(), data);
         let n = self.handle.write_bulk(self.ep_out, data, self.timeout)?;
         Ok(n)
     }

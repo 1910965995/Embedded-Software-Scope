@@ -63,6 +63,67 @@ impl DapProtocol {
     }
 
     // --------------------------------------------------------
+    // DAP_TransferConfigure (必须在 DAP_Transfer 之前调用)
+    // --------------------------------------------------------
+    /// 构建 DAP_TransferConfigure 请求
+    /// idle_cycles: 空闲周期数
+    /// wait_retry: WAIT 重试次数
+    /// match_retry: Match 重试次数
+    pub fn build_transfer_configure_request(idle_cycles: u8, wait_retry: u16, match_retry: u16) -> Vec<u8> {
+        let mut cmd = vec![DAP_TRANSFER_CONFIGURE, idle_cycles];
+        cmd.extend_from_slice(&wait_retry.to_le_bytes());
+        cmd.extend_from_slice(&match_retry.to_le_bytes());
+        cmd
+    }
+
+    pub fn parse_transfer_configure_response(data: &[u8]) -> Result<()> {
+        if data.len() < 2 {
+            return Err(Error::InvalidResponse("DAP_TransferConfigure 响应过短".into()));
+        }
+        if data[1] != 0 {
+            return Err(Error::InvalidResponse(format!("DAP_TransferConfigure 失败: 状态={}", data[1])));
+        }
+        Ok(())
+    }
+
+    // --------------------------------------------------------
+    // DAP_SWD_Configure (配置 SWD 通信参数)
+    // --------------------------------------------------------
+    /// 构建 DAP_SWD_Configure 请求
+    /// cfg: bit[1:0]=turnaround cycles, bit[2]=dataPhase(0=不使用,1=使用)
+    pub fn build_swd_configure_request(cfg: u8) -> Vec<u8> {
+        vec![DAP_SWD_CONFIGURE, cfg]
+    }
+
+    pub fn parse_swd_configure_response(data: &[u8]) -> Result<()> {
+        if data.len() < 2 {
+            return Err(Error::InvalidResponse("DAP_SWD_Configure 响应过短".into()));
+        }
+        if data[1] != 0 {
+            return Err(Error::InvalidResponse(format!("DAP_SWD_Configure 失败: 状态={}", data[1])));
+        }
+        Ok(())
+    }
+
+    // --------------------------------------------------------
+    // DAP_HostStatus (通知 DAP-Link 主机连接状态)
+    // --------------------------------------------------------
+    /// 构建 DAP_HostStatus 请求
+    /// status_type: 0=Connect, 1=Running
+    /// status: 0=Off, 1=On
+    pub fn build_host_status_request(status_type: u8, status: u8) -> Vec<u8> {
+        vec![DAP_LED, status_type, status]
+    }
+
+    pub fn parse_host_status_response(data: &[u8]) -> Result<()> {
+        if data.len() < 2 {
+            return Err(Error::InvalidResponse("DAP_HostStatus 响应过短".into()));
+        }
+        // 忽略状态，某些 DAP-Link 可能不支持
+        Ok(())
+    }
+
+    // --------------------------------------------------------
     // DAP_SWJ_PINS (控制 nRESET/SWCLK/SWDIO 引脚电平)
     // --------------------------------------------------------
     /// 构建 DAP_SWJ_PINS 请求
@@ -153,11 +214,11 @@ impl DapProtocol {
         requests: &[TransferRequest],
     ) -> Result<TransferResponse> {
         let cmd = self.build_transfer_request(requests);
-        log::debug!("DAP_Transfer 请求: {:02X?}", cmd);
+        log::debug!(">>> DAP_Transfer 请求 ({} 字节): {:02X?}", cmd.len(), cmd);
         usb.write(&cmd)?;
         let mut buf = vec![0u8; 1024];
         let n = usb.read(&mut buf)?;
-        log::info!("<<< DAP_Transfer 响应 ({} 字节): {:02X?}", n, &buf[..n]);
+        log::debug!("<<< DAP_Transfer 响应 ({} 字节): {:02X?}", n, &buf[..n]);
         DapProtocol::parse_transfer_response(&buf[..n])
     }
 

@@ -40,9 +40,15 @@ impl SwdLink {
     // --------------------------------------------------------
     // SWD 初始化流程
     // --------------------------------------------------------
-    /// 完整的 SWD 初始化序列
+    /// 完整的 SWD 初始化序列（精确匹配 Keil USB 抓包流程）
     pub fn init(&mut self) -> Result<DeviceInfo> {
         info!("=== SWD 初始化开始 ===");
+
+        // 0. 先断开之前可能残留的连接（清理 DAP-Link 状态）
+        let mut buf = [0u8; 64];
+        self.usb.write(&[DAP_DISCONNECT])?;
+        let _ = self.usb.read(&mut buf);
+        std::thread::sleep(std::time::Duration::from_millis(100));
 
         // 1. 查询 DAP-Link 信息
         let dap_info = self.dap.query_info(self.usb())?;
@@ -52,37 +58,54 @@ impl SwdLink {
         // 2. SWD 连接
         self.swd_connect()?;
 
-        // 3. 设置 SWD 时钟（AC7840X 先用保守的 1MHz）
-        let clock = 1_000_000u32;
+        // 3. 设置 SWD 时钟（10MHz，与 Keil 抓包一致）
+        let clock = 10_000_000u32;
         let cmd = self.dap.build_clock_request(clock);
         self.usb.write(&cmd)?;
-        let mut buf = [0u8; 64];
         let n = self.usb.read(&mut buf)?;
         DapProtocol::parse_clock_response(&buf[..n])?;
         info!("SWD 时钟: {} MHz", clock as f32 / 1_000_000.0);
 
-        // 4. 硬件复位目标 MCU
-        self.hardware_reset()?;
+        // 4. DAP_TransferConfigure (idle=0, wait_retry=100, match_retry=0)
+        let cfg_cmd = DapProtocol::build_transfer_configure_request(0, 100, 0);
+        self.usb.write(&cfg_cmd)?;
+        let n = self.usb.read(&mut buf)?;
+        DapProtocol::parse_transfer_configure_response(&buf[..n])?;
 
-        // 5. SWD 线复位 + JTAG-to-SWD 切换
-        self.swd_line_reset()?;
+        // 5. DAP_SWD_Configure (turnaround=1, 无 dataPhase)
+        let swd_cfg = DapProtocol::build_swd_configure_request(0x00);
+        self.usb.write(&swd_cfg)?;
+        let n = self.usb.read(&mut buf)?;
+        DapProtocol::parse_swd_configure_response(&buf[..n])?;
 
-        // 6. 先尝试写 DP SELECT=0 初始化端口，再读 DPIDR
-        let init_req = TransferRequest::write_dp(DP_REG_SELECT, 0);
-        let _ = self.dap.execute_transfer(self.usb(), &[init_req]);
+        // 6. DAP_HostStatus (Connect LED on)
+        let host_cmd = DapProtocol::build_host_status_request(0, 1);
+        self.usb.write(&host_cmd)?;
+        let n = self.usb.read(&mut buf)?;
+        DapProtocol::parse_host_status_response(&buf[..n])?;
 
-        // 7. 读取 DPIDR
+        // 7. 读取 DPIDR（DAP_Connect 已做 JTAG-to-SWD 切换，直接读）
         let dpidr = self.read_dpidr()?;
         info!("DPIDR = 0x{:08X}", dpidr);
 
-        // 7. 调试电源上电
+        // 8. 再次读取 DPIDR（确认连接稳定）
+        let _ = self.read_dpidr()?;
+
+        // 9. 调试电源上电（写 CTRL/STAT = CSYSPWRUPREQ | CDBGPWRUPREQ）
         self.power_up_debug()?;
 
-        // 8. 扫描 AP
+        // 10. 写 DP SELECT = 0
+        let select_req = TransferRequest::write_dp(DP_REG_SELECT, 0);
+        let resp = self.dap.execute_transfer(self.usb(), &[select_req])?;
+        if resp.status != TRANSFER_OK {
+            return Err(Error::Swd("写 SELECT 失败".into()));
+        }
+
+        // 11. 扫描 AP
         let ap_idr = self.scan_ap()?;
         info!("AP{} IDR = 0x{:08X}", self.ap_index, ap_idr);
 
-        // 9. 验证内存读取（读向量表地址 0x00000000）
+        // 12. 验证内存读取（读向量表地址 0x00000000）
         match self.read_memory(0x00000000) {
             Ok(v) => info!("验证读取 (0x00000000) = 0x{:08X} ✓", v),
             Err(e) => warn!("验证读取失败: {}", e),
@@ -125,30 +148,28 @@ impl SwdLink {
     }
 
     /// SWD 线复位 + JTAG-to-SWD 切换
+    /// SWD 线复位（精确匹配 Keil 抓包序列：Line Reset + JTAG-to-SWD + Line Reset）
     fn swd_line_reset(&self) -> Result<()> {
         info!("发送 SWD 初始化序列...");
         let mut buf = [0u8; 64];
 
-        // Line Reset: 56 bits TMS=1
-        let cmd1 = self.dap.build_swj_sequence_request(&[0xFF; 7]);
+        // 1. Line Reset: 51 bits TMS=1 (Keil: 12 33 FF FF FF FF FF FF FF)
+        let cmd1 = vec![DAP_SWJ_SEQUENCE, 51, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF];
         self.usb.write(&cmd1)?;
-        self.usb.read(&mut buf)?;
+        let n = self.usb.read(&mut buf)?;
+        info!("SWJ Line Reset 响应 ({} 字节): {:02X?}", n, &buf[..n]);
 
-        // JTAG-to-SWD: 16 bits (LSB-first 时 0x9E,0xE7 = MSB-first 时 0x79,0xE7)
-        // 两个顺序都试过: 先用原始 design.html 的值
-        let cmd2 = self.dap.build_swj_sequence_request(&[0x9E, 0xE7]);
+        // 2. JTAG-to-SWD 切换: 16 bits (Keil: 12 10 9E E7)
+        let cmd2 = vec![DAP_SWJ_SEQUENCE, 16, 0x9E, 0xE7];
         self.usb.write(&cmd2)?;
-        self.usb.read(&mut buf)?;
+        let n = self.usb.read(&mut buf)?;
+        info!("SWJ JTAG-to-SWD 响应 ({} 字节): {:02X?}", n, &buf[..n]);
 
-        // Line Reset: 56 bits TMS=1
-        let cmd3 = self.dap.build_swj_sequence_request(&[0xFF; 7]);
+        // 3. Line Reset: 51 bits TMS=1 (Keil: 12 33 FF FF FF FF FF FF FF)
+        let cmd3 = vec![DAP_SWJ_SEQUENCE, 51, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF];
         self.usb.write(&cmd3)?;
-        self.usb.read(&mut buf)?;
-
-        // Idle: 8 bits TMS=0
-        let cmd4 = self.dap.build_swj_sequence_request(&[0x00]);
-        self.usb.write(&cmd4)?;
-        self.usb.read(&mut buf)?;
+        let n = self.usb.read(&mut buf)?;
+        info!("SWJ Line Reset 2 响应 ({} 字节): {:02X?}", n, &buf[..n]);
 
         info!("SWD 序列完成");
         Ok(())
@@ -187,17 +208,26 @@ impl SwdLink {
 
     /// 调试电源上电
     fn power_up_debug(&self) -> Result<()> {
-        // 请求系统调试电源
+        // SWD 读操作有流水线延迟：前一个读的数据在 RDBUFF 中。
+        // 两次 DPIDR 读后，需要先读 RDBUFF 清空流水线，再做写操作。
+        let rdbuff_req = TransferRequest::read_dp(DP_REG_RDBUFF);
+        let _ = self.dap.execute_transfer(self.usb(), &[rdbuff_req])?;
+
+        // 请求系统调试电源（写 CTRL/STAT）
         let req1 = TransferRequest::write_dp(DP_REG_CTRL_STAT, CSYSPWRUPREQ | CDBGPWRUPREQ);
         let resp = self.dap.execute_transfer(self.usb(), &[req1])?;
         if resp.status != TRANSFER_OK {
-            return Err(Error::Swd("电源上电请求失败".into()));
+            return Err(Error::Swd(format!("电源上电请求失败: status={}, count={}", resp.status, resp.count)));
         }
 
-        // 读取 CTRL/STAT 确认电源就绪
+        // 读 CTRL/STAT 确认电源就绪（此 DAP-Link 无流水线延迟，直接返回）
         let req2 = TransferRequest::read_dp(DP_REG_CTRL_STAT);
         let resp = self.dap.execute_transfer(self.usb(), &[req2])?;
         let ctrl_stat = resp.data.first().copied().unwrap_or(0);
+
+        // 读 RDBUFF 消耗流水线中的残留数据
+        let rdbuff_req = TransferRequest::read_dp(DP_REG_RDBUFF);
+        let _ = self.dap.execute_transfer(self.usb(), &[rdbuff_req])?;
 
         if (ctrl_stat & (CSYSPWRUPACK | CDBGPWRUPACK)) != (CSYSPWRUPACK | CDBGPWRUPACK) {
             return Err(Error::Swd(format!("调试电源未就绪: CTRL/STAT=0x{:08X}", ctrl_stat)));
