@@ -49,9 +49,11 @@ impl PipelineEngine {
 
     /// 启动流水线，返回控制句柄
     ///
-    /// 此方法消费 PipelineEngine，启动两个后台线程，
-    /// 返回 PipelineHandle 供主线程消费环形缓冲区数据。
-    pub fn start(mut self) -> Result<PipelineHandle> {
+    /// 可重复调用（Stop 后再次 Start），不消费 self。
+    pub fn start(&self) -> Result<PipelineHandle> {
+        // 重置停止标志（上一次 stop 可能已将其置为 false）
+        self.running.store(true, Ordering::SeqCst);
+
         let ring = Arc::new(RingBuffer::new(200_000)); // 10秒 @ 20kHz
 
         let submit = self.spawn_submit_thread()?;
@@ -61,12 +63,12 @@ impl PipelineEngine {
             submit_handle: submit,
             collect_handle: collect,
             ring_buffer: ring,
-            running: self.running,
+            running: Arc::clone(&self.running),
         })
     }
 
     /// 启动提交线程
-    fn spawn_submit_thread(&mut self) -> Result<JoinHandle<()>> {
+    fn spawn_submit_thread(&self) -> Result<JoinHandle<()>> {
         let usb = Arc::clone(&self.usb);
         let interval_us = self.interval_us;
         let addresses = self.addresses.clone();

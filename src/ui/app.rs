@@ -1,18 +1,21 @@
 use crate::pipeline::sample::Sample;
+use crate::pipeline::sample::ValueType;
 use crate::pipeline::engine::{PipelineEngine, PipelineHandle};
 use super::display_buffer::DisplayBuffer;
 use super::waveform::WaveformPanel;
 use super::controls::{ControlPanel, AcquisitionState, AcquisitionCommand};
 use super::cursor::CursorState;
 
-/// 默认颜色调色板（6 种颜色循环使用）
-const CHANNEL_COLORS: [egui::Color32; 6] = [
+/// 默认颜色调色板（8 种颜色，支持最多 8 通道）
+const CHANNEL_COLORS: [egui::Color32; 8] = [
     egui::Color32::from_rgb(255, 68, 68),   // 红
     egui::Color32::from_rgb(68, 255, 68),   // 绿
     egui::Color32::from_rgb(68, 68, 255),   // 蓝
-    egui::Color32::from_rgb(255, 255, 68),  // 黄
+    egui::Color32::from_rgb(255, 200, 68),  // 橙
     egui::Color32::from_rgb(255, 68, 255),  // 品红
     egui::Color32::from_rgb(68, 255, 255),  // 青
+    egui::Color32::from_rgb(180, 180, 180), // 灰
+    egui::Color32::from_rgb(255, 150, 150), // 粉
 ];
 
 /// DAP Sampler 主应用
@@ -35,6 +38,8 @@ pub struct DapSamplerApp {
     temp_buf: Vec<Sample>,
     /// 采样间隔（微秒）
     interval_us: f64,
+    /// 标记本帧是否有新数据到达（用于波形缓存判断）
+    has_new_data: bool,
 }
 
 impl DapSamplerApp {
@@ -44,6 +49,7 @@ impl DapSamplerApp {
         addresses: Vec<String>,
         rate_hz: u32,
         target_count: Option<u64>,
+        value_types: Vec<ValueType>,
     ) -> Self {
         let num_channels = addresses.len();
         let channel_names: Vec<String> = addresses
@@ -60,17 +66,18 @@ impl DapSamplerApp {
             pipeline: None,
             engine: Some(engine),
             display_buf: DisplayBuffer::new(200_000), // 10 秒 @ 20kHz
-            waveform: WaveformPanel::new(channel_names, channel_colors, interval_us),
+            waveform: WaveformPanel::new(channel_names, channel_colors, interval_us, value_types),
             controls: ControlPanel::new(rate_hz, target_count),
             cursor: CursorState::new(),
             temp_buf: (0..1024).map(|_| Sample { seq: 0, values: vec![] }).collect(),
             interval_us,
+            has_new_data: false,
         }
     }
 
-    /// 启动采集
+    /// 启动采集（可重复调用）
     fn start_acquisition(&mut self) {
-        if let Some(engine) = self.engine.take() {
+        if let Some(ref engine) = self.engine {
             match engine.start() {
                 Ok(handle) => {
                     self.pipeline = Some(handle);
@@ -111,6 +118,7 @@ impl DapSamplerApp {
         if n > 0 {
             self.display_buf.push_batch(&self.temp_buf[..n]);
             self.controls.update_count(self.display_buf.next_seq());
+            self.has_new_data = true;
         }
     }
 }
@@ -149,7 +157,7 @@ impl eframe::App for DapSamplerApp {
             });
         });
 
-        // ---- 图例（通道开关） ----
+        // ---- 图例（通道开关 + 光标信息） ----
         egui::SidePanel::left("legend_panel")
             .resizable(false)
             .default_width(180.0)
@@ -160,10 +168,11 @@ impl eframe::App for DapSamplerApp {
                     let names = self.waveform.channel_names();
                     let name = names[i].to_string();
                     let color = CHANNEL_COLORS[i % CHANNEL_COLORS.len()];
+                    let mut visible = self.waveform.is_channel_visible(i);
                     ui.horizontal(|ui| {
                         ui.colored_label(color, "●");
-                        if ui.button(&name).clicked() {
-                            self.waveform.toggle_channel(i);
+                        if ui.checkbox(&mut visible, &name).changed() {
+                            self.waveform.set_channel_visible(i, visible);
                         }
                     });
                 }
@@ -171,11 +180,15 @@ impl eframe::App for DapSamplerApp {
 
                 // 光标信息
                 ui.heading("Cursor");
+                ui.label("Click: Cursor 1 | Click again: Cursor 2");
+                ui.label("Click 3rd time: reset Cursor 1");
                 let interval_us = self.interval_us;
+                let types = self.waveform.value_types().to_vec();
                 if let Some(r) = self.cursor.get_result(
                     self.display_buf.all(),
                     self.display_buf.oldest_seq(),
                     interval_us,
+                    &types,
                 ) {
                     ui.label(format!("T: {:.6}s", r.time_sec));
                     for (i, v) in r.values.iter().enumerate() {
@@ -188,33 +201,43 @@ impl eframe::App for DapSamplerApp {
                             self.display_buf.all(),
                             self.display_buf.oldest_seq(),
                             interval_us,
+                            &types,
                         ) {
                             ui.separator();
-                            ui.label(format!("ΔT: {:.6}s", dt));
+                            ui.label(format!("dT: {:.6}s", dt));
                             for (i, v) in dv.iter().enumerate() {
-                                ui.label(format!("  ΔCH{}: {:.4}", i + 1, v));
+                                ui.label(format!("  dCH{}: {:.4}", i + 1, v));
                             }
                         }
                     }
                 } else {
-                    ui.label("Click waveform to place cursor");
+                    ui.label("(no cursor placed)");
                 }
 
                 ui.separator();
-                if ui.button("Clear Cursor").clicked() {
-                    self.cursor.clear();
-                }
+                ui.horizontal(|ui| {
+                    if ui.button("Clear Cursor").clicked() {
+                        self.cursor.clear();
+                    }
+                    if ui.button("Auto Fit Y").clicked() {
+                        self.waveform.request_auto_fit_y();
+                    }
+                });
             });
 
         // ---- 中央波形区域 ----
+        let has_new_data = self.has_new_data;
+        self.has_new_data = false;
         egui::CentralPanel::default().show(ctx, |ui| {
             let available_width = ui.available_width();
-            self.waveform.show(
+            if let Some(seq) = self.waveform.show(
                 ui,
                 self.display_buf.all(),
                 available_width,
-                &self.cursor,
-            );
+                has_new_data,
+            ) {
+                self.cursor.click(seq);
+            }
         });
 
         // 请求持续刷新（60fps）

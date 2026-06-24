@@ -72,6 +72,13 @@ enum Command {
         /// 采样次数（默认无限）
         #[arg(long)]
         count: Option<u64>,
+
+        /// 变量类型列表（逗号分隔，如 float,int32,uint32）
+        ///
+        /// 每个地址对应一个类型，默认全部 float。
+        /// 支持: float, int32, uint32, int16, uint16, int8, uint8
+        #[arg(long, value_delimiter = ',')]
+        r#type: Option<Vec<String>>,
     },
 }
 
@@ -90,7 +97,9 @@ fn main() -> anyhow::Result<()> {
         Command::Sample { addresses, rate, count, float, output } => {
             cmd_sample(&addresses, rate, count, float, output.as_deref())
         }
-        Command::Gui { addresses, rate, count } => cmd_gui(&addresses, rate, count),
+        Command::Gui { addresses, rate, count, r#type } => {
+            cmd_gui(&addresses, rate, count, r#type.as_deref())
+        }
     }
 }
 
@@ -332,9 +341,15 @@ fn cmd_sample(
     Ok(())
 }
 
-fn cmd_gui(address_strs: &[String], rate: u32, count: Option<u64>) -> anyhow::Result<()> {
+fn cmd_gui(
+    address_strs: &[String],
+    rate: u32,
+    count: Option<u64>,
+    type_strs: Option<&[String]>,
+) -> anyhow::Result<()> {
     use dap_sampler::pipeline::engine::PipelineEngine;
     use dap_sampler::ui::app::DapSamplerApp;
+    use dap_sampler::pipeline::sample::ValueType;
 
     // 解析地址列表
     let addresses: Vec<u32> = address_strs
@@ -348,6 +363,23 @@ fn cmd_gui(address_strs: &[String], rate: u32, count: Option<u64>) -> anyhow::Re
     if addresses.len() > 8 {
         anyhow::bail!("最多支持 8 个变量，当前: {}", addresses.len());
     }
+
+    // 解析变量类型列表
+    let value_types: Vec<ValueType> = if let Some(type_strs) = type_strs {
+        if type_strs.len() != addresses.len() {
+            anyhow::bail!(
+                "类型数量 ({}) 与地址数量 ({}) 不一致",
+                type_strs.len(),
+                addresses.len()
+            );
+        }
+        type_strs
+            .iter()
+            .map(|s| ValueType::parse(s).map_err(anyhow::Error::msg))
+            .collect::<anyhow::Result<Vec<_>>>()?
+    } else {
+        vec![ValueType::Float; addresses.len()]
+    };
 
     // 连接并初始化 SWD
     println!("\u{1f50c} 正在连接 DAP-Link...");
@@ -364,6 +396,7 @@ fn cmd_gui(address_strs: &[String], rate: u32, count: Option<u64>) -> anyhow::Re
         address_strs.to_vec(),
         rate,
         count,
+        value_types,
     );
 
     let options = eframe::NativeOptions {

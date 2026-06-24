@@ -1,4 +1,4 @@
-use crate::pipeline::sample::Sample;
+use crate::pipeline::sample::{Sample, ValueType};
 
 /// 光标测量状态
 ///
@@ -56,6 +56,7 @@ impl CursorState {
         buffer: &[Sample],
         buffer_offset: u64,
         interval_us: f64,
+        types: &[ValueType],
     ) -> Option<CursorResult> {
         let seq = self.cursor1?;
         let local_idx = seq.checked_sub(buffer_offset)? as usize;
@@ -63,7 +64,7 @@ impl CursorState {
         Some(CursorResult {
             seq,
             time_sec: sample.timestamp_sec(interval_us),
-            values: sample.as_f64s(),
+            values: sample.as_f64s_typed(types),
         })
     }
 
@@ -75,15 +76,16 @@ impl CursorState {
         buffer: &[Sample],
         buffer_offset: u64,
         interval_us: f64,
+        types: &[ValueType],
     ) -> Option<(f64, Vec<f64>)> {
-        let r1 = self.get_result(buffer, buffer_offset, interval_us)?;
+        let r1 = self.get_result(buffer, buffer_offset, interval_us, types)?;
         let seq2 = self.cursor2?;
         let local_idx2 = seq2.checked_sub(buffer_offset)? as usize;
         let sample2 = buffer.get(local_idx2)?;
         let r2 = CursorResult {
             seq: seq2,
             time_sec: sample2.timestamp_sec(interval_us),
-            values: sample2.as_f64s(),
+            values: sample2.as_f64s_typed(types),
         };
 
         let dt = r2.time_sec - r1.time_sec;

@@ -29,15 +29,25 @@ impl DisplayBuffer {
     ///
     /// 如果超过 max_samples，自动丢弃最旧数据，更新 offset。
     pub fn push_batch(&mut self, batch: &[Sample]) {
-        self.samples.extend(batch.iter().cloned());
-        self.total_pushed += batch.len() as u64;
+        // 先丢弃超出容量的旧数据，再 extend，避免中间超额分配
+        let will_exceed = (self.samples.len() + batch.len()).saturating_sub(self.max_samples);
+        if will_exceed > 0 {
+            // 最多丢弃当前已有的数据（batch 本身超容量时由后续截断处理）
+            let drain_count = will_exceed.min(self.samples.len());
+            self.samples.drain(..drain_count);
+            self.offset += drain_count as u64;
+        }
 
-        // 一次性丢弃超出的旧数据（比逐个 remove(0) 高效得多）
+        self.samples.extend(batch.iter().cloned());
+
+        // 极端情况：batch 本身超过容量，截断保留最新部分
         let excess = self.samples.len().saturating_sub(self.max_samples);
         if excess > 0 {
             self.samples.drain(..excess);
             self.offset += excess as u64;
         }
+
+        self.total_pushed += batch.len() as u64;
     }
 
     /// 获取指定范围的采样点切片

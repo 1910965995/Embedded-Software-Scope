@@ -1,5 +1,5 @@
-use egui_plot::{Line, Legend, Plot};
-use crate::pipeline::sample::Sample;
+use egui_plot::{Line, Legend, Plot, PlotPoint};
+use crate::pipeline::sample::{Sample, ValueType};
 
 /// LTTB (Largest Triangle Three Buckets) 降采样
 ///
@@ -22,18 +22,20 @@ pub fn lttb_downsample(data: &[[f64; 2]], threshold: usize) -> Vec<[f64; 2]> {
     let mut result = Vec::with_capacity(threshold);
     result.push(data[0]); // 首点保留
 
-    let bucket_size = (n - 2) as f64 / (threshold - 2) as f64;
+    // 使用整数运算计算桶边界，避免浮点精度问题
+    let denom = threshold - 2;
+    let range = n - 2;
     let mut prev_selected = 0usize;
 
     for i in 0..(threshold - 2) {
         // 当前桶范围 [bucket_start, bucket_end)
-        let bucket_start = (i as f64 * bucket_size).floor() as usize + 1;
-        let bucket_end = (((i + 1) as f64 * bucket_size).floor() as usize + 1).min(n - 1);
+        let bucket_start = i * range / denom + 1;
+        let bucket_end = (((i + 1) * range / denom) + 1).min(n - 1);
         let bucket_end = bucket_end.max(bucket_start + 1);
 
         // 下一个桶范围（用于计算平均点）
         let next_start = bucket_end;
-        let next_end = (((i + 2) as f64 * bucket_size).floor() as usize + 1).min(n);
+        let next_end = (((i + 2) * range / denom) + 1).min(n);
 
         // 下一个桶的平均点
         let next_len = (next_end - next_start).max(1);
@@ -87,85 +89,180 @@ pub struct ChannelInfo {
 /// 波形面板
 ///
 /// 持有通道配置，负责从 Sample 数据构建 egui_plot 的 Line 对象并渲染。
+/// 内部缓存降采样结果，仅在新数据到达时重建，避免每帧遍历整个缓冲区。
 pub struct WaveformPanel {
     /// 通道配置
     channels: Vec<ChannelInfo>,
     /// 采样间隔（微秒），用于时间戳推算
     interval_us: f64,
+    /// 变量类型列表
+    value_types: Vec<ValueType>,
+    /// 降采样缓存（每通道一条），使用 PlotPoint 以支持零拷贝借用
+    cached_points: Vec<Vec<PlotPoint>>,
+    /// 缓存对应的缓冲区长度（0 表示需要重建）
+    cache_buffer_len: usize,
+    /// 上一帧的可视 X 范围（秒），用于动态 X 轴标签
+    last_x_range: Option<f64>,
+    /// 是否需要自动调整 Y 轴范围
+    auto_fit_y: bool,
 }
 
 impl WaveformPanel {
-    pub fn new(channel_names: Vec<String>, channel_colors: Vec<egui::Color32>, interval_us: f64) -> Self {
+    pub fn new(
+        channel_names: Vec<String>,
+        channel_colors: Vec<egui::Color32>,
+        interval_us: f64,
+        value_types: Vec<ValueType>,
+    ) -> Self {
+        let n = channel_names.len();
         let channels = channel_names
             .into_iter()
             .zip(channel_colors)
             .map(|(name, color)| ChannelInfo { name, color, visible: true })
             .collect();
-        Self { channels, interval_us }
+        Self {
+            channels,
+            interval_us,
+            value_types,
+            cached_points: vec![Vec::new(); n],
+            cache_buffer_len: 0,
+            last_x_range: None,
+            auto_fit_y: false,
+        }
     }
 
     /// 渲染波形
     ///
-    /// `ui` 是 egui 的 Ui 对象，`buffer` 是显示缓冲区，`visible_width` 是 Plot 像素宽度。
+    /// 返回 `Some(seq)` 表示用户在波形上点击放置光标（seq 为点击位置对应的采样序号）。
+    /// `has_new_data` 为 true 时重建降采样缓存。
     pub fn show(
         &mut self,
         ui: &mut egui::Ui,
         buffer: &[Sample],
         visible_width: f32,
-        _cursors: &super::cursor::CursorState,
-    ) {
+        has_new_data: bool,
+    ) -> Option<u64> {
         if buffer.is_empty() {
             ui.label("Waiting for data...");
-            return;
+            return None;
         }
 
         let target_points = (visible_width as usize * 3).min(100_000); // 3 倍像素宽度
 
-        Plot::new("waveform_plot")
+        // 缓存判断：仅在新数据到达或通道可见性变化时重建
+        if has_new_data || self.cache_buffer_len != buffer.len() {
+            self.rebuild_cache(buffer, target_points);
+            self.cache_buffer_len = buffer.len();
+        }
+
+        // 动态 X 轴标签（使用上一帧的可视范围）
+        let x_label = match self.last_x_range {
+            Some(r) => format!("Time (s) [window: {:.2}s]", r),
+            None => "Time (s)".to_string(),
+        };
+
+        // Y 轴标签带类型信息
+        let y_label = if self.value_types.iter().all(|t| *t == ValueType::Float) {
+            "Value (float)".to_string()
+        } else {
+            let labels: Vec<&str> = self.value_types.iter().map(|t| t.label()).collect();
+            format!("Value ({})", labels.join("/"))
+        };
+
+        let mut clicked_seq: Option<u64> = None;
+        let auto_fit = self.auto_fit_y;
+        self.auto_fit_y = false; // 一次性触发
+
+        let mut plot = Plot::new("waveform_plot")
             .legend(Legend::default())
-            .x_axis_label("Time (s)")
-            .y_axis_label("Value")
+            .show_grid(true)
+            .show_axes(true)
+            .x_axis_label(x_label)
+            .y_axis_label(y_label)
             .allow_zoom(true)
             .allow_drag(true)
-            .allow_scroll(true)
-            .show(ui, |plot_ui| {
-                for (ch_idx, ch) in self.channels.iter().enumerate() {
-                    if !ch.visible {
-                        continue;
-                    }
+            .allow_scroll(true);
 
-                    // 构建 [x, y] 数据点序列
-                    let points: Vec<[f64; 2]> = buffer
-                        .iter()
-                        .filter_map(|s| {
-                            let val = s.as_f64s().get(ch_idx).copied().unwrap_or(0.0);
-                            if val.is_finite() {
-                                Some([s.timestamp_sec(self.interval_us), val])
-                            } else {
-                                None
-                            }
-                        })
-                        .collect();
+        if auto_fit {
+            plot = plot.auto_bounds(egui::Vec2b::new(false, true));
+        }
 
-                    if points.is_empty() {
-                        continue;
-                    }
+        let plot_response = plot.show(ui, |plot_ui| {
+            // 捕获鼠标坐标（用于光标点击）
+            let pointer_coord = plot_ui.pointer_coordinate();
 
-                    // 降采样
-                    let display_points = if points.len() > target_points {
-                        lttb_downsample(&points, target_points)
-                    } else {
-                        points
-                    };
+            // 记录可视范围（用于下一帧的 X 轴标签）
+            let bounds = plot_ui.plot_bounds();
+            self.last_x_range = Some(bounds.max()[0] - bounds.min()[0]);
 
-                    plot_ui.line(
-                        Line::new(display_points)
-                            .name(&ch.name)
-                            .color(ch.color)
-                            .width(1.5),
-                    );
+            // 渲染各通道波形（零拷贝借用缓存数据）
+            for (ch_idx, ch) in self.channels.iter().enumerate() {
+                if !ch.visible {
+                    continue;
                 }
-            });
+                let points = &self.cached_points[ch_idx];
+                if points.is_empty() {
+                    continue;
+                }
+                plot_ui.line(
+                    Line::new(points.as_slice())
+                        .name(&ch.name)
+                        .color(ch.color)
+                        .width(1.5),
+                );
+            }
+
+            // 检测点击 → 放置光标
+            if plot_ui.response().clicked() {
+                if let Some(coord) = pointer_coord {
+                    // 从 X 坐标（秒）反推采样序号
+                    let seq = (coord.x * 1_000_000.0 / self.interval_us).round() as u64;
+                    clicked_seq = Some(seq);
+                }
+            }
+        });
+
+        let _ = plot_response;
+        clicked_seq
+    }
+
+    /// 重建降采样缓存
+    fn rebuild_cache(&mut self, buffer: &[Sample], target_points: usize) {
+        for (ch_idx, ch) in self.channels.iter().enumerate() {
+            if !ch.visible {
+                self.cached_points[ch_idx].clear();
+                continue;
+            }
+
+            let vt = self.value_types.get(ch_idx).copied().unwrap_or(ValueType::Float);
+
+            // 构建 [x, y] 数据点序列
+            let raw_points: Vec<[f64; 2]> = buffer
+                .iter()
+                .filter_map(|s| {
+                    let raw = s.values.get(ch_idx).copied().unwrap_or(0);
+                    let val = vt.to_f64(raw);
+                    if val.is_finite() {
+                        Some([s.timestamp_sec(self.interval_us), val])
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            // 降采样
+            let downsampled = if raw_points.len() > target_points {
+                lttb_downsample(&raw_points, target_points)
+            } else {
+                raw_points
+            };
+
+            // 转换为 PlotPoint 以支持零拷贝借用
+            self.cached_points[ch_idx] = downsampled
+                .into_iter()
+                .map(PlotPoint::from)
+                .collect();
+        }
     }
 
     /// 切换通道可见性
@@ -173,6 +270,28 @@ impl WaveformPanel {
         if let Some(ch) = self.channels.get_mut(index) {
             ch.visible = !ch.visible;
         }
+        // 通道可见性变化时强制重建缓存
+        self.cache_buffer_len = 0;
+    }
+
+    /// 查询通道可见性
+    pub fn is_channel_visible(&self, index: usize) -> bool {
+        self.channels.get(index).map(|ch| ch.visible).unwrap_or(false)
+    }
+
+    /// 设置通道可见性
+    pub fn set_channel_visible(&mut self, index: usize, visible: bool) {
+        if let Some(ch) = self.channels.get_mut(index) {
+            if ch.visible != visible {
+                ch.visible = visible;
+                self.cache_buffer_len = 0; // 强制重建缓存
+            }
+        }
+    }
+
+    /// 触发自动调整 Y 轴范围
+    pub fn request_auto_fit_y(&mut self) {
+        self.auto_fit_y = true;
     }
 
     pub fn channel_count(&self) -> usize {
@@ -181,5 +300,9 @@ impl WaveformPanel {
 
     pub fn channel_names(&self) -> Vec<&str> {
         self.channels.iter().map(|c| c.name.as_str()).collect()
+    }
+
+    pub fn value_types(&self) -> &[ValueType] {
+        &self.value_types
     }
 }
