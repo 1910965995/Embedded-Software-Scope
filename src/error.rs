@@ -20,6 +20,12 @@ pub enum Error {
     #[error("操作超时")]
     Timeout,
 
+    #[error("流水线线程启动失败: {0}")]
+    PipelineThread(String),
+
+    #[error("流水线已停止")]
+    PipelineStopped,
+
     #[error("{0}")]
     Other(String),
 }

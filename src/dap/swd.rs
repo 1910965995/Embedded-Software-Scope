@@ -37,6 +37,12 @@ impl SwdLink {
         &self.dap
     }
 
+    /// 消费 SwdLink，提取底层 USB 传输和协议处理器
+    /// 用于流水线引擎接管已初始化的 SWD 链路
+    pub fn into_parts(self) -> (BulkTransfer, DapProtocol) {
+        (self.usb, self.dap)
+    }
+
     // --------------------------------------------------------
     // SWD 初始化流程
     // --------------------------------------------------------

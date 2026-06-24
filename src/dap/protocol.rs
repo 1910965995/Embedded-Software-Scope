@@ -3,8 +3,9 @@ use crate::dap::commands::*;
 use crate::usb::transfer::BulkTransfer;
 
 /// DAP 协议处理层
+#[derive(Clone, Copy)]
 pub struct DapProtocol {
-    dap_index: u8,
+    pub dap_index: u8,
 }
 
 impl DapProtocol {
