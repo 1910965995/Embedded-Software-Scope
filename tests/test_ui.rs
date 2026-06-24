@@ -1,0 +1,187 @@
+/// UI 逻辑单元测试：LTTB 降采样、DisplayBuffer、光标计算
+use dap_sampler::ui::waveform::lttb_downsample;
+use dap_sampler::ui::display_buffer::DisplayBuffer;
+use dap_sampler::ui::cursor::CursorState;
+use dap_sampler::pipeline::sample::Sample;
+
+// ============================================================
+// LTTB 降采样测试
+// ============================================================
+
+#[test]
+fn lttb_preserves_endpoints() {
+    let data: Vec<[f64; 2]> = (0..100).map(|i| [i as f64, (i as f64).sin()]).collect();
+    let result = lttb_downsample(&data, 10);
+    assert_eq!(result.first().unwrap()[0], data.first().unwrap()[0]);
+    assert_eq!(result.last().unwrap()[0], data.last().unwrap()[0]);
+}
+
+#[test]
+fn lttb_no_downsample_when_few_points() {
+    let data: Vec<[f64; 2]> = (0..5).map(|i| [i as f64, i as f64]).collect();
+    let result = lttb_downsample(&data, 10);
+    assert_eq!(result.len(), 5);
+    assert_eq!(result, data);
+}
+
+#[test]
+fn lttb_reduces_to_target() {
+    let data: Vec<[f64; 2]> = (0..1000).map(|i| [i as f64, i as f64]).collect();
+    let result = lttb_downsample(&data, 50);
+    assert_eq!(result.len(), 50);
+}
+
+#[test]
+fn lttb_linear_data_preserved() {
+    // 线性数据降采样后两端应保持一致
+    let data: Vec<[f64; 2]> = (0..100).map(|i| [i as f64, i as f64 * 2.0]).collect();
+    let result = lttb_downsample(&data, 10);
+    assert!((result[0][1] - 0.0).abs() < 0.01);
+    assert!((result[9][1] - 198.0).abs() < 0.01);
+}
+
+#[test]
+fn lttb_threshold_too_small() {
+    let data: Vec<[f64; 2]> = (0..100).map(|i| [i as f64, i as f64]).collect();
+    // threshold < 3 → return original data
+    let result = lttb_downsample(&data, 2);
+    assert_eq!(result.len(), 100);
+}
+
+// ============================================================
+// DisplayBuffer 测试
+// ============================================================
+
+fn make_sample(seq: u64, val: u32) -> Sample {
+    Sample { seq, values: vec![val] }
+}
+
+#[test]
+fn display_buffer_push_and_slice() {
+    let mut buf = DisplayBuffer::new(1000);
+    let samples: Vec<Sample> = (0..100).map(|i| make_sample(i, i as u32)).collect();
+    buf.push_batch(&samples);
+
+    assert_eq!(buf.len(), 100);
+    assert!(!buf.is_empty());
+
+    // 切片
+    let slice = buf.slice(50, 60);
+    assert_eq!(slice.len(), 10);
+    assert_eq!(slice[0].seq, 50);
+    assert_eq!(slice[9].seq, 59);
+}
+
+#[test]
+fn display_buffer_overflow_drops_oldest() {
+    let mut buf = DisplayBuffer::new(50);
+    let samples: Vec<Sample> = (0..100).map(|i| make_sample(i, i as u32)).collect();
+    buf.push_batch(&samples);
+
+    // 只保留最近 50 个
+    assert_eq!(buf.len(), 50);
+    assert_eq!(buf.oldest_seq(), 50); // 前 50 个被丢弃
+    assert_eq!(buf.next_seq(), 100);
+}
+
+#[test]
+fn display_buffer_empty() {
+    let buf = DisplayBuffer::new(100);
+    assert!(buf.is_empty());
+    assert_eq!(buf.len(), 0);
+    assert_eq!(buf.slice(0, 10).len(), 0);
+}
+
+#[test]
+fn display_buffer_slice_out_of_range() {
+    let mut buf = DisplayBuffer::new(100);
+    let samples: Vec<Sample> = (0..10).map(|i| make_sample(i, i as u32)).collect();
+    buf.push_batch(&samples);
+
+    // 请求超出范围的切片
+    assert_eq!(buf.slice(100, 110).len(), 0);
+    assert_eq!(buf.slice(5, 5).len(), 0); // start == end
+}
+
+#[test]
+fn display_buffer_all() {
+    let mut buf = DisplayBuffer::new(100);
+    let samples: Vec<Sample> = (0..10).map(|i| make_sample(i, i as u32)).collect();
+    buf.push_batch(&samples);
+
+    let all = buf.all();
+    assert_eq!(all.len(), 10);
+    assert_eq!(all[0].seq, 0);
+    assert_eq!(all[9].seq, 9);
+}
+
+// ============================================================
+// 光标计算测试
+// ============================================================
+
+/// 创建一个 Sample，值以 f32 bit pattern 存储
+fn make_float_sample(seq: u64, val: f32) -> Sample {
+    Sample { seq, values: vec![val.to_bits()] }
+}
+
+#[test]
+fn cursor_click_cycle() {
+    let mut c = CursorState::new();
+    assert!(c.cursor1.is_none());
+    assert!(c.cursor2.is_none());
+
+    c.click(100);
+    assert_eq!(c.cursor1, Some(100));
+    assert!(c.cursor2.is_none());
+
+    c.click(200);
+    assert_eq!(c.cursor1, Some(100));
+    assert_eq!(c.cursor2, Some(200));
+
+    c.click(300);
+    assert_eq!(c.cursor1, Some(300)); // 重置
+    assert!(c.cursor2.is_none());
+
+    c.clear();
+    assert!(c.cursor1.is_none());
+    assert!(c.cursor2.is_none());
+}
+
+#[test]
+fn cursor_get_result() {
+    // 使用 f32 bit pattern 存储值，使 as_f64s() 正确还原
+    let samples: Vec<Sample> = (0..10).map(|i| make_float_sample(i, i as f32 * 10.0)).collect();
+
+    let c = CursorState { cursor1: Some(5), cursor2: None };
+    let r = c.get_result(&samples, 0, 1000.0).unwrap();
+    assert_eq!(r.seq, 5);
+    assert!((r.time_sec - 0.005).abs() < 1e-9); // seq=5, 1000μs → 5ms
+    assert!((r.values[0] - 50.0).abs() < 0.1);   // 5 * 10.0 = 50.0
+
+    // 超出范围
+    let c2 = CursorState { cursor1: Some(100), cursor2: None };
+    assert!(c2.get_result(&samples, 0, 1000.0).is_none());
+}
+
+#[test]
+fn cursor_delta() {
+    let samples: Vec<Sample> = (0..10).map(|i| make_float_sample(i, i as f32 * 10.0)).collect();
+
+    let c = CursorState { cursor1: Some(2), cursor2: Some(8) };
+    let (dt, dv) = c.delta(&samples, 0, 1000.0).unwrap();
+    assert!((dt - 0.006).abs() < 1e-9); // (8-2) × 1ms = 6ms
+    assert!((dv[0] - 60.0).abs() < 0.1);  // 80-20=60
+}
+
+#[test]
+fn cursor_get_result_with_offset() {
+    // 测试带 offset 的情况（DisplayBuffer 丢弃了旧数据）
+    let samples: Vec<Sample> = (0..10).map(|i| make_float_sample(i + 50, i as f32 * 10.0)).collect();
+
+    // buffer_offset = 50
+    let c = CursorState { cursor1: Some(55), cursor2: None };
+    let r = c.get_result(&samples, 50, 1000.0).unwrap();
+    assert_eq!(r.seq, 55);
+    assert!((r.time_sec - 0.055).abs() < 1e-9); // seq=55, 1000μs → 55ms
+    assert!((r.values[0] - 50.0).abs() < 0.1);
+}

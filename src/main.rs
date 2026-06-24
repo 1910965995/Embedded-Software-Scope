@@ -59,6 +59,20 @@ enum Command {
         #[arg(long)]
         output: Option<String>,
     },
+    /// 启动 GUI 波形显示（P3）
+    Gui {
+        /// 内存地址列表（十六进制，逗号分隔）
+        #[arg(long, value_delimiter = ',')]
+        addresses: Vec<String>,
+
+        /// 采样率 (Hz)
+        #[arg(long, default_value = "20000")]
+        rate: u32,
+
+        /// 采样次数（默认无限）
+        #[arg(long)]
+        count: Option<u64>,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -76,6 +90,7 @@ fn main() -> anyhow::Result<()> {
         Command::Sample { addresses, rate, count, float, output } => {
             cmd_sample(&addresses, rate, count, float, output.as_deref())
         }
+        Command::Gui { addresses, rate, count } => cmd_gui(&addresses, rate, count),
     }
 }
 
@@ -313,6 +328,55 @@ fn cmd_sample(
         let actual_duration = actual_count as f64 / rate as f64;
         println!("   实际时长: {:.3}s", actual_duration);
     }
+
+    Ok(())
+}
+
+fn cmd_gui(address_strs: &[String], rate: u32, count: Option<u64>) -> anyhow::Result<()> {
+    use dap_sampler::pipeline::engine::PipelineEngine;
+    use dap_sampler::ui::app::DapSamplerApp;
+
+    // 解析地址列表
+    let addresses: Vec<u32> = address_strs
+        .iter()
+        .map(|s| parse_address(s))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+
+    if addresses.is_empty() {
+        anyhow::bail!("至少需要指定一个内存地址");
+    }
+    if addresses.len() > 8 {
+        anyhow::bail!("最多支持 8 个变量，当前: {}", addresses.len());
+    }
+
+    // 连接并初始化 SWD
+    println!("\u{1f50c} 正在连接 DAP-Link...");
+    let mut swd = SwdLink::new()?;
+    swd.init()?;
+    let (usb, dap) = swd.into_parts();
+
+    // 创建流水线引擎（不立即启动，由 GUI 的开始按钮触发）
+    let engine = PipelineEngine::new(usb, dap, addresses, rate);
+
+    // 启动 egui 窗口
+    let app = DapSamplerApp::new(
+        engine,
+        address_strs.to_vec(),
+        rate,
+        count,
+    );
+
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([1280.0, 720.0]),
+        ..Default::default()
+    };
+
+    eframe::run_native(
+        "DAP Sampler",
+        options,
+        Box::new(|_cc| Ok(Box::new(app))),
+    ).map_err(|e| anyhow::anyhow!("GUI failed: {}", e))?;
 
     Ok(())
 }

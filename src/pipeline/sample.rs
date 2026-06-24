@@ -20,4 +20,11 @@ impl Sample {
     pub fn as_floats(&self) -> Vec<f32> {
         self.values.iter().map(|&v| f32::from_bits(v)).collect()
     }
+
+    /// 将原始 u32 值数组解释为 f64 数组（egui_plot 使用 f64 坐标）
+    ///
+    /// 每个 u32 被解释为 f32 的位模式，然后提升为 f64。
+    pub fn as_f64s(&self) -> Vec<f64> {
+        self.values.iter().map(|&v| f64::from(f32::from_bits(v))).collect()
+    }
 }

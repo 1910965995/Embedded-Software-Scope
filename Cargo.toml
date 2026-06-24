@@ -12,3 +12,8 @@ env_logger = "0.11"
 anyhow = "1"
 thiserror = "1"
 spin_sleep = "1"
+
+# P3: GUI
+eframe = "0.31"
+egui = "0.31"
+egui_plot = "0.31"
