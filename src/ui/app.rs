@@ -453,6 +453,17 @@ impl eframe::App for DapSamplerApp {
     }
 }
 
+/// 确保 DapSamplerApp 被销毁时释放 USB 设备（即使 on_exit 未被调用）
+impl Drop for DapSamplerApp {
+    fn drop(&mut self) {
+        if let Some(handle) = self.pipeline.take() {
+            handle.stop();
+        }
+        // 显式释放 USB，确保 Keil 等工具可以立即使用 DAP-Link
+        self.active_usb = None;
+    }
+}
+
 fn render_tab_button(
     ui: &mut egui::Ui,
     label: &str,
