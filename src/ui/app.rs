@@ -364,7 +364,6 @@ impl DapSamplerApp {
     }
 
     fn show_cursor_info(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Cursor");
         ui.label(
             egui::RichText::new("点击波形放置光标 1\n再次点击放置光标 2")
                 .small()
@@ -410,14 +409,7 @@ impl DapSamplerApp {
                 }
             }
         } else {
-            ui.label(
-                egui::RichText::new("(未放置光标)")
-                    .color(egui::Color32::from_rgb(0x8b, 0x94, 0x9e)),
-            );
-        }
-        ui.separator();
-        if ui.button("Clear Cursor").clicked() {
-            self.cursor.clear();
+            // 未放置光标时不显示任何内容
         }
     }
 }

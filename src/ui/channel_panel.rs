@@ -36,12 +36,8 @@ impl ChannelPanel {
 
         if self.channels.is_empty() {
             ui.label("暂无通道");
-            ui.label("在「变量」标签页中勾选变量以添加通道");
             return None;
         }
-
-        ui.label(format!("通道数: {} / 8", self.channels.len()));
-        ui.separator();
 
         egui::ScrollArea::vertical()
             .id_salt("channel_scroll")

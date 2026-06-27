@@ -27,7 +27,6 @@ impl VariableBrowser {
     ) -> Vec<(String, bool)> {
         if elf_ctx.is_none() {
             ui.label("未加载 ELF 文件");
-            ui.label("点击 📁 Open ELF 加载固件");
             return vec![];
         }
 

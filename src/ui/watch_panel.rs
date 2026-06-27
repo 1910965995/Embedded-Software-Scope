@@ -86,7 +86,6 @@ impl WatchPanel {
     pub fn show(&mut self, ui: &mut egui::Ui) {
         if self.entries.is_empty() {
             ui.label("暂无 Watch 变量");
-            ui.label("在左侧变量浏览器中勾选变量以添加");
             return;
         }
 
