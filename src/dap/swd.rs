@@ -315,6 +315,26 @@ impl SwdLink {
         Ok(resp.data)
     }
 
+    /// 写入 32 位内存值（单地址）
+    ///
+    /// 通过 SWD 向目标地址写入一个 32 位值：
+    /// 1. 写 AP TAR = address（设置目标地址）
+    /// 2. 写 AP DRW = data（写入数据）
+    pub fn write_memory(&self, address: u32, data: u32) -> Result<()> {
+        let requests = [
+            TransferRequest::write_ap(AP_REG_TAR, address),
+            TransferRequest::write_ap(AP_REG_DRW, data),
+        ];
+
+        let resp = self.dap.execute_transfer(self.usb(), &requests)?;
+
+        if resp.status != TRANSFER_OK {
+            return Err(Error::TransferFailed(resp.status, resp.count));
+        }
+
+        Ok(())
+    }
+
     /// 读取内存并解析为 float
     pub fn read_float(&self, address: u32) -> Result<f32> {
         let raw = self.read_memory(address)?;

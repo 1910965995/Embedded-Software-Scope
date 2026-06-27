@@ -25,6 +25,9 @@ pub struct PipelineEngine {
     interval_us: u64,
     /// 停止标志（主线程设为 false 时，子线程退出）
     running: Arc<AtomicBool>,
+    /// 写入请求队列（主线程推送，提交线程消费）
+    /// 元素: (地址, 数据)
+    write_queue: Arc<Mutex<VecDeque<(u32, u32)>>>,
 }
 
 impl PipelineEngine {
@@ -46,6 +49,7 @@ impl PipelineEngine {
             addresses,
             interval_us,
             running: Arc::new(AtomicBool::new(true)),
+            write_queue: Arc::new(Mutex::new(VecDeque::new())),
         }
     }
 
@@ -53,12 +57,14 @@ impl PipelineEngine {
     ///
     /// 采样率在 UI 中修改后调用，返回新引擎替换旧的。
     pub fn with_rate(&self, rate_hz: u32) -> Self {
-        Self::new(
-            Arc::clone(&self.usb),
-            self.dap,
-            self.addresses.clone(),
-            rate_hz,
-        )
+        Self {
+            usb: Arc::clone(&self.usb),
+            dap: self.dap,
+            addresses: self.addresses.clone(),
+            interval_us: (1_000_000.0 / rate_hz as f64) as u64,
+            running: Arc::new(AtomicBool::new(true)),
+            write_queue: Arc::clone(&self.write_queue),
+        }
     }
 
     /// 启动流水线，返回控制句柄
@@ -86,6 +92,7 @@ impl PipelineEngine {
             collect_handle: collect,
             ring_buffer: ring,
             running: Arc::clone(&self.running),
+            write_queue: Arc::clone(&self.write_queue),
         })
     }
 
@@ -99,6 +106,7 @@ impl PipelineEngine {
         let interval_us = self.interval_us;
         let addresses = self.addresses.clone();
         let running = Arc::clone(&self.running);
+        let write_queue = Arc::clone(&self.write_queue);
 
         // 预构建 TransferRequest 数组（每次采样都一样）
         // 每变量 = 写 TAR + 读 DRW，共 2 条请求
@@ -112,7 +120,6 @@ impl PipelineEngine {
             })
             .collect();
 
-        let request_count = requests.len() as u8;
         let dap_index = self.dap.dap_index;
 
         let handle = thread::Builder::new()
@@ -136,7 +143,31 @@ impl PipelineEngine {
                     }
 
                     // --- 构造 DAP_Transfer 命令 ---
-                    let mut cmd = vec![DAP_TRANSFER, dap_index, request_count];
+                    // 检查是否有待写入的请求，有则附加到命令前部
+                    let mut pending_writes: Vec<(u32, u32)> = Vec::new();
+                    if let Ok(mut wq) = write_queue.lock() {
+                        while let Some((addr, data)) = wq.pop_front() {
+                            pending_writes.push((addr, data));
+                        }
+                    }
+
+                    // 构建 request 列表：[写入请求...] + [读取请求...]
+                    // 写入: write TAR + write DRW (2 requests, 无返回数据)
+                    // 读取: write TAR + read DRW (2 requests, 1 返回数据)
+                    let total_requests = requests.len() + pending_writes.len() * 2;
+                    let mut cmd = vec![DAP_TRANSFER, dap_index, total_requests as u8];
+
+                    // 先写入请求
+                    for &(addr, data) in &pending_writes {
+                        let w_tar = TransferRequest::write_ap(AP_REG_TAR, addr);
+                        let w_drw = TransferRequest::write_ap(AP_REG_DRW, data);
+                        cmd.push(w_tar.request_byte());
+                        cmd.extend_from_slice(&addr.to_le_bytes());
+                        cmd.push(w_drw.request_byte());
+                        cmd.extend_from_slice(&data.to_le_bytes());
+                    }
+
+                    // 再读取请求
                     for req in &requests {
                         cmd.push(req.request_byte());
                         if !req.rnw {
@@ -147,6 +178,12 @@ impl PipelineEngine {
 
                     // --- 发送命令（200ms 超时）---
                     // write_nonblock 使用 200ms 超时，确保停止标志能被及时检查到
+                    if !pending_writes.is_empty() {
+                        log::info!(
+                            "提交线程注入 {} 个写入请求 (seq={})",
+                            pending_writes.len(), seq
+                        );
+                    }
                     if let Err(e) = usb.write_nonblock(&cmd) {
                         if !running.load(Ordering::Relaxed) {
                             // 停止中遇到的超时/错误，正常退出
@@ -284,9 +321,20 @@ pub struct PipelineHandle {
     collect_handle: JoinHandle<()>,
     ring_buffer: Arc<RingBuffer>,
     running: Arc<AtomicBool>,
+    write_queue: Arc<Mutex<VecDeque<(u32, u32)>>>,
 }
 
 impl PipelineHandle {
+    /// 推入一个写入请求（地址 + 数据）
+    ///
+    /// 提交线程会在下一个采样周期将此写入操作与读取操作合并为一条
+    /// DAP_Transfer 命令，不影响正常采样。
+    pub fn queue_write(&self, address: u32, data: u32) {
+        if let Ok(mut wq) = self.write_queue.lock() {
+            wq.push_back((address, data));
+        }
+    }
+
     /// 从环形缓冲区批量读取采样点
     ///
     /// 返回实际读取的数量（可能少于 buf.len()）。

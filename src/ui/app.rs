@@ -58,6 +58,8 @@ pub struct DapSamplerApp {
     manual_channel_names: Vec<String>,
     manual_value_types: Vec<ValueType>,
     rate_hz: u32,
+    /// 当前采集的通道地址列表（与通道一一对应，用于 Watch 写入）
+    current_addresses: Vec<u32>,
     #[allow(dead_code)]
     target_count: Option<u64>,
     /// 波形显示模式
@@ -144,6 +146,7 @@ impl DapSamplerApp {
             manual_channel_names,
             manual_value_types,
             rate_hz,
+            current_addresses: Vec::new(),
             target_count,
             display_mode,
             window_size: 2000,
@@ -193,6 +196,9 @@ impl DapSamplerApp {
         if addresses.is_empty() {
             return;
         }
+
+        // 保存当前通道地址列表（用于 Watch 写入）
+        self.current_addresses = addresses.clone();
 
         // 2. 连接 USB + 初始化 SWD（仅在尚未连接时）
         if self.active_usb.is_none() {
@@ -322,11 +328,68 @@ impl DapSamplerApp {
         if n > 0 {
             // 更新 Watch 面板的变量值
             for sample in &self.temp_buf[..n] {
-                self.watch_panel.update_values(&sample.values);
+                self.watch_panel.update_values(&sample.values, self.rate_hz);
             }
             self.display_buf.push_batch(&self.temp_buf[..n]);
             self.controls.update_count(self.display_buf.next_seq());
             self.has_new_data = true;
+        }
+
+        // 处理 Watch 面板的写入请求
+        self.process_pending_writes();
+    }
+
+    /// 处理 Watch 表格中的值写入请求
+    ///
+    /// 通过 pipeline 的写入队列注入，不停止采集。
+    /// 写入操作会在下一个采样周期与读取操作合并为一条 DAP_Transfer 命令。
+    fn process_pending_writes(&mut self) {
+        let writes = self.watch_panel.drain_writes();
+        if writes.is_empty() {
+            return;
+        }
+
+        if self.current_addresses.is_empty() {
+            log::warn!("写入请求被忽略：无通道地址");
+            return;
+        }
+
+        if let Some(ref handle) = self.pipeline {
+            for w in &writes {
+                if let Some(&addr) = self.current_addresses.get(w.channel_idx) {
+                    handle.queue_write(addr, w.raw_value);
+                    log::info!(
+                        "已排队写入通道 {}: 0x{:08X} → 0x{:08X}",
+                        w.channel_idx, w.raw_value, addr
+                    );
+                } else {
+                    log::warn!("通道索引 {} 超出地址范围", w.channel_idx);
+                }
+            }
+        } else {
+            // 采集未运行时，直接通过 SwdLink 写入
+            match SwdLink::new() {
+                Ok(mut swd) => {
+                    if let Err(e) = swd.init() {
+                        log::error!("写入前 SWD 初始化失败: {}", e);
+                        return;
+                    }
+                    for w in &writes {
+                        if let Some(&addr) = self.current_addresses.get(w.channel_idx) {
+                            match swd.write_memory(addr, w.raw_value) {
+                                Ok(()) => log::info!(
+                                    "已写入通道 {}: 0x{:08X} → 0x{:08X}",
+                                    w.channel_idx, w.raw_value, addr
+                                ),
+                                Err(e) => log::error!(
+                                    "写入通道 {} 失败: {}", w.channel_idx, e
+                                ),
+                            }
+                        }
+                    }
+                }
+                Err(e) => log::error!("写入时连接 DAP-Link 失败: {}", e),
+            }
         }
     }
 
