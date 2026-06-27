@@ -29,7 +29,7 @@ enum Command {
         /// 内存地址（十六进制）
         address: String,
         /// 采样率 (Hz)
-        #[arg(long, default_value = "1000")]
+        #[arg(long, default_value = "10000")]
         rate: u32,
         /// 采样次数（默认无限次）
         #[arg(long)]
@@ -45,7 +45,7 @@ enum Command {
         addresses: Vec<String>,
 
         /// 采样率 (Hz)
-        #[arg(long, default_value = "20000")]
+        #[arg(long, default_value = "10000")]
         rate: u32,
 
         /// 采样次数（默认无限）
@@ -67,7 +67,7 @@ enum Command {
         addresses: Vec<String>,
 
         /// 采样率 (Hz)
-        #[arg(long, default_value = "20000")]
+        #[arg(long, default_value = "10000")]
         rate: u32,
 
         /// 采样次数（默认无限）

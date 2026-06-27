@@ -50,6 +50,10 @@ pub struct DapSamplerApp {
     channel_panel: ChannelPanel,
     /// Watch 面板（示波器下方）
     watch_panel: WatchPanel,
+    /// 左侧面板各模块的展开/收起状态
+    var_browser_open: bool,
+    channels_open: bool,
+    cursor_open: bool,
     #[allow(dead_code)]
     manual_channel_names: Vec<String>,
     manual_value_types: Vec<ValueType>,
@@ -134,6 +138,9 @@ impl DapSamplerApp {
             variable_browser: VariableBrowser::new(),
             channel_panel,
             watch_panel,
+            var_browser_open: false,
+            channels_open: false,
+            cursor_open: false,
             manual_channel_names,
             manual_value_types,
             rate_hz,
@@ -269,6 +276,7 @@ impl DapSamplerApp {
     ///
     /// 先停止流水线（如果在运行），然后显式调用 release_interface + reset。
     /// 如果没有活跃的 USB 连接，也尝试直接扫描 USB 总线释放被占用的设备。
+    #[allow(dead_code)]
     fn release_daplink(&mut self) {
         log::info!("用户请求释放 DAP-Link");
         // 先停止流水线
@@ -466,13 +474,6 @@ impl eframe::App for DapSamplerApp {
 
                 // 右对齐：采样信息 + 释放按钮
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("\u{1f50c} Release DAP-Link")
-                        .on_hover_text("强制释放 USB 设备，让 Keil 等工具可以使用 DAP-Link")
-                        .clicked() {
-                        self.release_daplink();
-                    }
-                    ui.separator();
-
                     // 采集进度
                     if let Some(target) = self.controls.target_count {
                         let pct = (self.controls.total_samples as f64 / target as f64 * 100.0).min(100.0);
@@ -506,46 +507,60 @@ impl eframe::App for DapSamplerApp {
             });
         });
 
-        // ---- 左侧变量浏览器 ----
+        // ---- 左侧面板：变量浏览器 + 通道 + 光标（可展开/收起）----
         egui::SidePanel::left("sidebar")
             .resizable(true)
-            .default_width(280.0)
+            .default_width(220.0)
             .width_range(220.0..=400.0)
             .show(ctx, |ui| {
-                ui.heading("\u{53d8}\u{91cf}\u{6d4f}\u{89c8}\u{5668}");
-                ui.separator();
-                let changes = self.variable_browser.show(
-                    ui,
-                    self.elf_ctx.as_ref(),
-                );
-                if !changes.is_empty() {
-                    self.apply_variable_changes(changes);
-                }
-            });
+                egui::ScrollArea::vertical()
+                    .id_salt("sidebar_scroll")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        // --- 变量浏览器模块 ---
+                        egui::CollapsingHeader::new("变量浏览器")
+                            .default_open(self.var_browser_open)
+                            .id_salt("var_browser_header")
+                            .show(ui, |ui| {
+                                let changes = self.variable_browser.show(
+                                    ui,
+                                    self.elf_ctx.as_ref(),
+                                );
+                                if !changes.is_empty() {
+                                    self.apply_variable_changes(changes);
+                                }
+                            });
 
-        // ---- 右侧通道 + 光标面板 ----
-        egui::SidePanel::right("right_panel")
-            .resizable(true)
-            .default_width(240.0)
-            .width_range(200.0..=320.0)
-            .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.heading("\u{901a}\u{9053}");
-                    ui.label(format!("{} / 8", self.channel_panel.channel_count()));
-                });
-                ui.separator();
-                if let Some(remove_idx) = self.channel_panel.show(ui) {
-                    let name = self.channel_panel.channels[remove_idx].name.clone();
-                    self.variable_browser.checked_paths.remove(&name);
-                    self.channel_panel.remove_channel(remove_idx);
-                    // 同步 Watch 面板
-                    let names: Vec<String> = self.channel_panel.channels.iter().map(|c| c.name.clone()).collect();
-                    let types: Vec<ValueType> = self.channel_panel.channels.iter().map(|c| c.value_type).collect();
-                    self.watch_panel.sync_from_channels(&names, &types);
-                }
+                        ui.separator();
 
-                ui.separator();
-                self.show_cursor_info(ui);
+                        // --- 通道模块 ---
+                        egui::CollapsingHeader::new(
+                            format!("通道 ({}/8)", self.channel_panel.channel_count())
+                        )
+                            .default_open(self.channels_open)
+                            .id_salt("channels_header")
+                            .show(ui, |ui| {
+                                if let Some(remove_idx) = self.channel_panel.show(ui) {
+                                    let name = self.channel_panel.channels[remove_idx].name.clone();
+                                    self.variable_browser.checked_paths.remove(&name);
+                                    self.channel_panel.remove_channel(remove_idx);
+                                    // 同步 Watch 面板
+                                    let names: Vec<String> = self.channel_panel.channels.iter().map(|c| c.name.clone()).collect();
+                                    let types: Vec<ValueType> = self.channel_panel.channels.iter().map(|c| c.value_type).collect();
+                                    self.watch_panel.sync_from_channels(&names, &types);
+                                }
+                            });
+
+                        ui.separator();
+
+                        // --- 光标模块 ---
+                        egui::CollapsingHeader::new("光标")
+                            .default_open(self.cursor_open)
+                            .id_salt("cursor_header")
+                            .show(ui, |ui| {
+                                self.show_cursor_info(ui);
+                            });
+                    });
             });
 
         // ---- 底部 Watch 面板 ----
@@ -662,6 +677,7 @@ impl Drop for DapSamplerApp {
 ///
 /// 当程序没有活跃的 USB 连接但设备仍被占用时使用。
 /// 遍历 USB 总线，找到 DAP-Link 设备，打开后 release 所有接口再关闭。
+#[allow(dead_code)]
 fn force_release_all_daplink() {
     use rusb::{Context, UsbContext};
     use crate::usb::device::KNOWN_DEVICES;

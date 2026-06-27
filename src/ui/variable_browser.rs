@@ -63,12 +63,11 @@ impl VariableBrowser {
                 .collect()
         };
 
-        // 按 source_file 分组显示，ScrollArea 填充所有可用高度
-        let available_height = ui.available_height();
+        // 按 source_file 分组显示，ScrollArea 限制最大高度
         egui::ScrollArea::vertical()
             .id_salt("variable_scroll")
-            .auto_shrink([false, false])
-            .max_height(available_height)
+            .auto_shrink([false, true])
+            .max_height(400.0)
             .show(ui, |ui| {
                 let mut current_group: Option<String> = None;
 
