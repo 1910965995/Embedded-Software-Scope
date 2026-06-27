@@ -627,6 +627,11 @@ impl eframe::App for DapSamplerApp {
                 self.watch_panel.show(ui);
             });
 
+        // 把本帧 watch 表中提交的 y_offset/y_scale 变更应用到波形图
+        for (name, offset, scale) in self.watch_panel.drain_changed_transforms() {
+            self.waveform.set_channel_transform(&name, offset, scale);
+        }
+
         // ---- 中央：工具栏 + 波形 ----
         self.sync_channel_visibility();
         let has_new_data = self.has_new_data;

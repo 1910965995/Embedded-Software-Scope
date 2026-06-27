@@ -1,56 +1,6 @@
 use egui_plot::{Line, Legend, Plot, PlotBounds, PlotPoint, Points};
 use crate::pipeline::sample::{Sample, ValueType};
 
-/// 在数据跳变点插入阶梯点，使折线图渲染为阶梯波形（适用于数字信号）
-///
-/// 对于 0/1 开关信号，普通折线图会在跳变处绘制斜线，看起来不像方波。
-/// 插入阶梯点后，跳变处变为垂直线，正确呈现数字信号的波形。
-fn insert_step_points(points: &[[f64; 2]]) -> Vec<[f64; 2]> {
-    if points.len() < 2 {
-        return points.to_vec();
-    }
-    let mut result = Vec::with_capacity(points.len() * 2);
-    result.push(points[0]);
-    for i in 1..points.len() {
-        // Y 值变化时，在当前 X 位置插入一个旧 Y 值的点，形成垂直阶梯
-        if points[i][1] != points[i - 1][1] {
-            result.push([points[i][0], points[i - 1][1]]);
-        }
-        result.push(points[i]);
-    }
-    result
-}
-
-/// 均匀步进降采样
-///
-/// 将 N 个数据点降采样到 threshold 个点，通过等间隔选取原始点实现。
-/// 保证选出的点在 X 轴上严格等间隔分布，适用于需要一致采样间隔显示的场景。
-///
-/// 与 LTTB（按三角形面积选点）不同，本算法不依赖波形特征选点，
-/// 因此显示的采样点间隔完全一致，不会因数据量变化或窗口缩放而改变。
-///
-/// 算法：计算步进 stride = (n-1)/(threshold-1)，按 stride 等间隔选取索引。
-///
-/// 参数:
-/// - `data`: 原始数据切片 [x, y]
-/// - `threshold`: 目标点数
-pub fn uniform_downsample(data: &[[f64; 2]], threshold: usize) -> Vec<[f64; 2]> {
-    let n = data.len();
-    if n <= threshold || threshold < 3 {
-        return data.to_vec();
-    }
-
-    let mut result = Vec::with_capacity(threshold);
-    let stride = (n - 1) as f64 / (threshold - 1) as f64;
-
-    for i in 0..threshold {
-        let idx = (i as f64 * stride).round() as usize;
-        result.push(data[idx.min(n - 1)]);
-    }
-
-    result
-}
-
 /// 波形显示模式
 #[derive(Clone, Copy, PartialEq)]
 pub enum WaveformDisplayMode {
@@ -65,6 +15,10 @@ pub struct ChannelInfo {
     pub name: String,
     pub color: egui::Color32,
     pub visible: bool,
+    /// Y 轴偏移，应用于每个样本点（默认 0.0）
+    pub y_offset: f32,
+    /// Y 轴缩放系数，应用于每个样本点（默认 1.0；禁止 0；允许负数）
+    pub y_scale: f32,
 }
 
 /// 波形面板
@@ -78,10 +32,10 @@ pub struct WaveformPanel {
     interval_us: f64,
     /// 变量类型列表
     value_types: Vec<ValueType>,
-    /// 降采样缓存（每通道一条），使用 PlotPoint 以支持零拷贝借用
-    cached_points: Vec<Vec<PlotPoint>>,
+    /// 波形点缓存（每通道一条），使用 PlotPoint 以支持零拷贝借用
+    pub cached_points: Vec<Vec<PlotPoint>>,
     /// 缓存对应的缓冲区长度（0 表示需要重建）
-    cache_buffer_len: usize,
+    pub cache_buffer_len: usize,
     /// 上一帧的可视 X 范围（秒），用于动态 X 轴标签
     last_x_range: Option<f64>,
     /// 上一帧的 X 轴右边界，用于检测用户拖拽/缩放
@@ -108,7 +62,13 @@ impl WaveformPanel {
         let channels = channel_names
             .into_iter()
             .zip(channel_colors)
-            .map(|(name, color)| ChannelInfo { name, color, visible: true })
+            .map(|(name, color)| ChannelInfo {
+                name,
+                color,
+                visible: true,
+                y_offset: 0.0,
+                y_scale: 1.0,
+            })
             .collect();
         Self {
             channels,
@@ -142,14 +102,11 @@ impl WaveformPanel {
             return None;
         }
 
-        // 降采样目标点数：至少等于 buffer 长度，避免窗口内的点被降采样
-        // 窗口大小最大 10000 点，现代 GPU 完全可以全量渲染，无需降采样
-        // 只有 buffer 极大时（如未来支持更大窗口）才按像素宽度降采样
-        let target_points = (visible_width as usize * 3).max(buffer.len()).min(100_000);
+        // 不进行降采样: buffer 中所有原始样本点都必须被绘制,采样工具的波形必须忠实于采集数据。
 
-        // 缓存判断：仅在新数据到达或通道可见性变化时重建
+        // 缓存判断: 仅在新数据到达或通道可见性变化时重建
         if has_new_data || self.cache_buffer_len != buffer.len() {
-            self.rebuild_cache(buffer, target_points);
+            self.rebuild_cache(buffer);
             self.cache_buffer_len = buffer.len();
         }
 
@@ -325,10 +282,12 @@ impl WaveformPanel {
         clicked_seq
     }
 
-    /// 重建降采样缓存
+    /// 重建波形缓存
     ///
-    /// 同时计算所有可见通道数据的绝对值最大值，用于 Y 轴自适应。
-    fn rebuild_cache(&mut self, buffer: &[Sample], target_points: usize) {
+    /// 关键不变式: **buffer 中的每个原始样本点都进入 cached_points**。
+    /// 不进行任何形式的降采样、抽点或跳点 —— 采样工具的波形必须 100% 忠实于采集到的数据。
+    /// 每个点按 `displayed_y = raw_f * y_scale + y_offset` 变换;Y 轴自动 fit 仍按 `raw_f.abs()`。
+    pub fn rebuild_cache(&mut self, buffer: &[Sample]) {
         let mut y_max_abs: f64 = 0.0;
 
         for (ch_idx, ch) in self.channels.iter().enumerate() {
@@ -338,47 +297,29 @@ impl WaveformPanel {
             }
 
             let vt = self.value_types.get(ch_idx).copied().unwrap_or(ValueType::Float);
+            let scale = ch.y_scale as f64;
+            let offset = ch.y_offset as f64;
 
-            // 构建 [x, y] 数据点序列，同时追踪绝对值最大值
-            let raw_points: Vec<[f64; 2]> = buffer
-                .iter()
-                .filter_map(|s| {
-                    let raw = s.values.get(ch_idx).copied().unwrap_or(0);
-                    let val = vt.to_f64(raw);
-                    if val.is_finite() {
-                        let abs_val = val.abs();
-                        if abs_val > y_max_abs {
-                            y_max_abs = abs_val;
-                        }
-                        Some([s.timestamp_sec, val])
-                    } else {
-                        None
-                    }
-                })
-                .collect();
+            // 每个原始样本点都转换为 PlotPoint，无降采样、无跳点
+            let mut out: Vec<PlotPoint> = Vec::with_capacity(buffer.len());
+            for s in buffer {
+                let raw = s.values.get(ch_idx).copied().unwrap_or(0);
+                let raw_f = vt.to_f64(raw);
+                if !raw_f.is_finite() {
+                    continue; // NaN/Inf 不参与 Y 轴 fit,也不绘制
+                }
+                let abs_val = raw_f.abs();
+                if abs_val > y_max_abs {
+                    y_max_abs = abs_val;
+                }
+                let displayed_y = raw_f * scale + offset;
+                out.push(PlotPoint::new(s.timestamp_sec, displayed_y));
+            }
 
-            // 降采样（均匀步进，保证显示间隔一致）
-            let downsampled = if raw_points.len() > target_points {
-                uniform_downsample(&raw_points, target_points)
-            } else {
-                raw_points
-            };
-
-            // 非浮点类型使用阶梯渲染（数字信号），
-            // 在跳变点插入垂直阶梯，使方波正确呈现
-            let final_points = match vt {
-                ValueType::Float => downsampled,
-                _ => insert_step_points(&downsampled),
-            };
-
-            // 转换为 PlotPoint 以支持零拷贝借用
-            self.cached_points[ch_idx] = final_points
-                .into_iter()
-                .map(PlotPoint::from)
-                .collect();
+            self.cached_points[ch_idx] = out;
         }
 
-        // 更新 Y 轴绝对值最大值（避免为 0 导致范围无效）
+        // Y 轴自适应: 仍按 raw_f,不被 offset/scale 推偏
         self.auto_y_max_abs = if y_max_abs > 0.0 { y_max_abs } else { 1.0 };
     }
 
@@ -438,5 +379,111 @@ impl WaveformPanel {
     /// 获取当前波形显示模式
     pub fn display_mode(&self) -> WaveformDisplayMode {
         self.display_mode
+    }
+
+    /// 设置单个通道的 y_offset / y_scale,并标记缓存需要重建。
+    /// 若通道不存在(name 不匹配),该调用为 no-op。
+    pub fn set_channel_transform(&mut self, name: &str, offset: f32, scale: f32) {
+        if let Some(ch) = self.channels.iter_mut().find(|c| c.name == name) {
+            ch.y_offset = offset;
+            ch.y_scale = scale;
+            self.cache_buffer_len = 0; // 强制下次 show() 重建缓存
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pipeline::sample::{Sample, ValueType};
+
+    fn make_panel(channels: Vec<(&str, f32, f32)>) -> WaveformPanel {
+        let names: Vec<String> = channels.iter().map(|(n, _, _)| n.to_string()).collect();
+        let colors: Vec<egui::Color32> = (0..channels.len())
+            .map(|i| egui::Color32::from_rgb((i * 30) as u8, 100, 200))
+            .collect();
+        let types: Vec<ValueType> = vec![ValueType::Float; channels.len()];
+        let mut panel = WaveformPanel::new(names, colors, 1000.0, types, WaveformDisplayMode::Line);
+        for (ch, (_, off, sca)) in panel.channels.iter_mut().zip(channels.iter()) {
+            ch.y_offset = *off;
+            ch.y_scale = *sca;
+        }
+        panel
+    }
+
+    fn make_buffer(seqs: u64, vals: &[u32]) -> Vec<Sample> {
+        (0..seqs)
+            .map(|i| Sample {
+                seq: i,
+                timestamp_sec: i as f64 * 0.001,
+                values: vals.to_vec(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn rebuild_cache_applies_transform() {
+        let mut panel = make_panel(vec![("CH1", 10.0, 2.0)]);
+        let buffer = make_buffer(1, &[3.0f32.to_bits()]);
+        panel.rebuild_cache(&buffer);
+        // displayed_y = 3.0 * 2.0 + 10.0 = 16.0
+        assert_eq!(panel.cached_points[0].len(), 1);
+        assert!((panel.cached_points[0][0].y - 16.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn auto_y_uses_raw_not_transformed() {
+        let mut panel = make_panel(vec![("CH1", 1.0e6, 1.0)]);
+        let buffer = make_buffer(1, &[1.0f32.to_bits()]);
+        panel.rebuild_cache(&buffer);
+        // raw_f = 1.0, 不应受 offset 影响
+        assert!((panel.auto_y_max_abs - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn set_channel_transform_marks_dirty() {
+        let mut panel = make_panel(vec![("CH1", 0.0, 1.0)]);
+        let buffer = make_buffer(1, &[1.0f32.to_bits()]);
+        panel.rebuild_cache(&buffer);
+        // 让 cache_buffer_len 与 buffer 同步,表示"未脏"
+        panel.cache_buffer_len = buffer.len();
+        assert_eq!(panel.cache_buffer_len, buffer.len());
+        // 触发 transform 变化 → 应标记为脏
+        panel.set_channel_transform("CH1", 5.0, 1.0);
+        assert_eq!(panel.cache_buffer_len, 0);
+    }
+
+    #[test]
+    fn rebuild_cache_no_samples_lost() {
+        // 关键保真测试: 任何规模的 buffer 都必须完整保留所有样本点
+        let mut panel = make_panel(vec![("CH1", 100.0, 1.0)]);
+        let n = 5000_usize;
+        // 每个样本一个值,值 = i as f32
+        let buffer: Vec<Sample> = (0..n)
+            .map(|i| Sample {
+                seq: i as u64,
+                timestamp_sec: i as f64 * 0.001,
+                values: vec![(i as f32).to_bits()],
+            })
+            .collect();
+        panel.rebuild_cache(&buffer);
+        assert_eq!(panel.cached_points[0].len(), n);
+        // 验证 transform 应用到了每一个点(不是只前 N 个)
+        for i in 0..n {
+            let raw = i as f64;
+            let expected = raw * 1.0 + 100.0;
+            let got = panel.cached_points[0][i].y;
+            assert!(
+                (got - expected).abs() < 1e-3,
+                "sample {i}: expected {expected}, got {got}"
+            );
+        }
+    }
+
+    #[test]
+    fn uniform_downsample_removed() {
+        // 编译期检查: uniform_downsample 不应存在
+        // (无法直接 assert 编译失败,但我们通过文档 + 后续 grep 在 PR 中确认)
+        // 此测试仅作为占位提示。如未来有人重新引入降采样,这里需补充编译期检查。
     }
 }

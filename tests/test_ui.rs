@@ -1,52 +1,7 @@
-/// UI 逻辑单元测试：LTTB 降采样、DisplayBuffer、光标计算、类型系统
-use dap_sampler::ui::waveform::lttb_downsample;
+/// UI 逻辑单元测试: DisplayBuffer、光标计算、类型系统
 use dap_sampler::ui::display_buffer::DisplayBuffer;
 use dap_sampler::ui::cursor::CursorState;
 use dap_sampler::pipeline::sample::{Sample, ValueType};
-
-// ============================================================
-// LTTB 降采样测试
-// ============================================================
-
-#[test]
-fn lttb_preserves_endpoints() {
-    let data: Vec<[f64; 2]> = (0..100).map(|i| [i as f64, (i as f64).sin()]).collect();
-    let result = lttb_downsample(&data, 10);
-    assert_eq!(result.first().unwrap()[0], data.first().unwrap()[0]);
-    assert_eq!(result.last().unwrap()[0], data.last().unwrap()[0]);
-}
-
-#[test]
-fn lttb_no_downsample_when_few_points() {
-    let data: Vec<[f64; 2]> = (0..5).map(|i| [i as f64, i as f64]).collect();
-    let result = lttb_downsample(&data, 10);
-    assert_eq!(result.len(), 5);
-    assert_eq!(result, data);
-}
-
-#[test]
-fn lttb_reduces_to_target() {
-    let data: Vec<[f64; 2]> = (0..1000).map(|i| [i as f64, i as f64]).collect();
-    let result = lttb_downsample(&data, 50);
-    assert_eq!(result.len(), 50);
-}
-
-#[test]
-fn lttb_linear_data_preserved() {
-    // 线性数据降采样后两端应保持一致
-    let data: Vec<[f64; 2]> = (0..100).map(|i| [i as f64, i as f64 * 2.0]).collect();
-    let result = lttb_downsample(&data, 10);
-    assert!((result[0][1] - 0.0).abs() < 0.01);
-    assert!((result[9][1] - 198.0).abs() < 0.01);
-}
-
-#[test]
-fn lttb_threshold_too_small() {
-    let data: Vec<[f64; 2]> = (0..100).map(|i| [i as f64, i as f64]).collect();
-    // threshold < 3 → return original data
-    let result = lttb_downsample(&data, 2);
-    assert_eq!(result.len(), 100);
-}
 
 // ============================================================
 // DisplayBuffer 测试

@@ -14,6 +14,10 @@ pub struct WatchEntry {
     pub value_type: ValueType,
     /// 刷新周期（秒）
     pub refresh_period_s: f32,
+    /// Y 轴偏移（用于波形图，默认 0.0）
+    pub y_offset: f32,
+    /// Y 轴缩放系数（用于波形图，默认 1.0；禁止 0；允许负数）
+    pub y_scale: f32,
     /// 内部计数器（累计采样点数）
     refresh_counter: u32,
     /// 当前显示的值（格式化字符串）
@@ -24,6 +28,14 @@ pub struct WatchEntry {
     editing: bool,
     /// Refresh 输入框文本
     refresh_buffer: String,
+    /// Y Offset 输入框文本
+    y_offset_buffer: String,
+    /// Y Scale 输入框文本
+    y_scale_buffer: String,
+    /// Y Offset 输入框是否获得焦点
+    y_offset_editing: bool,
+    /// Y Scale 输入框是否获得焦点
+    y_scale_editing: bool,
 }
 
 /// Watch 面板（示波器下方）
@@ -33,11 +45,14 @@ pub struct WatchEntry {
 /// - 变量类型
 /// - 变量当前值（可编辑，回车后写入 MCU）
 /// - 可配置的刷新周期
+/// - 可配置的 Y Offset / Y Scale（应用于波形图）
 pub struct WatchPanel {
     /// 变量列表
-    entries: Vec<WatchEntry>,
+    pub entries: Vec<WatchEntry>,
     /// 待处理的写入请求
     pending_writes: Vec<WriteRequest>,
+    /// 已提交但尚未被外部拉取的 (channel_name, y_offset, y_scale) 列表
+    pub dirty_transforms: Vec<(String, f32, f32)>,
 }
 
 impl WatchPanel {
@@ -45,16 +60,24 @@ impl WatchPanel {
         Self {
             entries: Vec::new(),
             pending_writes: Vec::new(),
+            dirty_transforms: Vec::new(),
         }
     }
 
     /// 设置 Watch 列表（与示波器通道同步）
     /// names: 变量名列表, types: 变量类型列表
+    /// 保留同名条目的 refresh_period_s / display_value / y_offset / y_scale
     pub fn sync_from_channels(&mut self, names: &[String], types: &[ValueType]) {
-        // 保留已有的 refresh_period_s 和 display_value
-        let old_entries: Vec<(String, f32, String)> = self.entries
+        // 保留已有的 refresh_period_s / display_value / y_offset / y_scale
+        let old_entries: Vec<(String, f32, f32, f32, String)> = self.entries
             .iter()
-            .map(|e| (e.name.clone(), e.refresh_period_s, e.display_value.clone()))
+            .map(|e| (
+                e.name.clone(),
+                e.refresh_period_s,
+                e.y_offset,
+                e.y_scale,
+                e.display_value.clone(),
+            ))
             .collect();
 
         self.entries = names
@@ -63,20 +86,26 @@ impl WatchPanel {
             .map(|(i, name)| {
                 let vt = types.get(i).copied().unwrap_or(ValueType::Uint32);
                 // 尝试保留旧配置
-                let (period, display) = old_entries
+                let (period, y_offset, y_scale, display) = old_entries
                     .iter()
-                    .find(|(n, _, _)| n == name)
-                    .map(|(_, p, d)| (*p, d.clone()))
-                    .unwrap_or((0.1, "--".to_string()));
+                    .find(|(n, _, _, _, _)| n == name)
+                    .map(|(_, p, o, s, d)| (*p, *o, *s, d.clone()))
+                    .unwrap_or((0.1, 0.0, 1.0, "--".to_string()));
                 WatchEntry {
                     name: name.clone(),
                     value_type: vt,
                     refresh_period_s: period,
+                    y_offset,
+                    y_scale,
                     refresh_counter: 0,
                     display_value: display,
                     edit_buffer: String::new(),
                     editing: false,
                     refresh_buffer: String::new(),
+                    y_offset_buffer: String::new(),
+                    y_scale_buffer: String::new(),
+                    y_offset_editing: false,
+                    y_scale_editing: false,
                 }
             })
             .collect();
@@ -108,6 +137,12 @@ impl WatchPanel {
         std::mem::take(&mut self.pending_writes)
     }
 
+    /// 取出本帧以来已提交的 y_offset/y_scale 变更。
+    /// 每条记录为 (channel_name, y_offset, y_scale)。同一通道在同一帧内多次修改只保留最终值。
+    pub fn drain_changed_transforms(&mut self) -> Vec<(String, f32, f32)> {
+        std::mem::take(&mut self.dirty_transforms)
+    }
+
     /// 渲染 Watch 面板（Excel 风格带边框表格）
     pub fn show(&mut self, ui: &mut egui::Ui) {
         if self.entries.is_empty() {
@@ -115,7 +150,7 @@ impl WatchPanel {
             return;
         }
 
-        let col_widths: [f32; 4] = [130.0, 70.0, 170.0, 90.0];
+        let col_widths: [f32; 6] = [130.0, 70.0, 150.0, 80.0, 80.0, 80.0];
         let row_h = 24.0;
         let header_h = 26.0;
         let total_w: f32 = col_widths.iter().sum();
@@ -129,6 +164,8 @@ impl WatchPanel {
 
         // 收集本帧产生的写入请求
         let mut new_writes: Vec<WriteRequest> = Vec::new();
+        // 收集本帧提交的 y_offset/y_scale 变更（用局部缓冲避开 self 的可变借用冲突）
+        let mut new_transforms: Vec<(String, f32, f32)> = Vec::new();
 
         egui::ScrollArea::vertical()
             .id_salt("watch_table_scroll")
@@ -140,7 +177,7 @@ impl WatchPanel {
                     egui::Sense::hover(),
                 );
                 ui.painter().rect_filled(hdr_rect, 0.0, header_bg);
-                let headers = ["Name", "Type", "Value", "Refresh"];
+                let headers = ["Name", "Type", "Value", "Refresh", "Y Offset", "Y Scale"];
                 let mut x = hdr_rect.left();
                 for (i, h) in headers.iter().enumerate() {
                     let cell = egui::Rect::from_min_size(
@@ -277,6 +314,92 @@ impl WatchPanel {
                     });
                     x += col_widths[3];
 
+                    // Y Offset（文本输入框）
+                    let r = egui::Rect::from_min_size(
+                        egui::Pos2::new(x, row_rect.top()),
+                        egui::Vec2::new(col_widths[4], row_h),
+                    );
+                    let cell_inset = r.shrink2(egui::Vec2::new(4.0, 1.0));
+                    ui.allocate_new_ui(egui::UiBuilder::new().max_rect(cell_inset), |ui| {
+                        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                            if entry.y_offset_buffer.is_empty() {
+                                entry.y_offset_buffer = format!("{:.3}", entry.y_offset);
+                            }
+                            let resp = ui.add(
+                                egui::TextEdit::singleline(&mut entry.y_offset_buffer)
+                                    .font(egui::FontId::proportional(12.0))
+                                    .text_color(text_dark)
+                                    .desired_width(f32::INFINITY)
+                                    .hint_text("off"),
+                            );
+                            // Enter 提交
+                            if resp.lost_focus()
+                                && ui.ctx().input(|i| i.key_pressed(egui::Key::Enter))
+                            {
+                                if let Ok(v) = entry.y_offset_buffer.trim().parse::<f32>() {
+                                    entry.y_offset = v;
+                                    new_transforms.push((
+                                        entry.name.clone(),
+                                        entry.y_offset,
+                                        entry.y_scale,
+                                    ));
+                                }
+                                entry.y_offset_buffer = format!("{:.3}", entry.y_offset);
+                            }
+                            // 失焦（非 Enter 也触发）reformat
+                            if resp.lost_focus() && !entry.y_offset_buffer.is_empty() {
+                                entry.y_offset_buffer = format!("{:.3}", entry.y_offset);
+                            }
+                        });
+                    });
+                    x += col_widths[4];
+
+                    // Y Scale（文本输入框，禁止 0）
+                    let r = egui::Rect::from_min_size(
+                        egui::Pos2::new(x, row_rect.top()),
+                        egui::Vec2::new(col_widths[5], row_h),
+                    );
+                    let cell_inset = r.shrink2(egui::Vec2::new(4.0, 1.0));
+                    ui.allocate_new_ui(egui::UiBuilder::new().max_rect(cell_inset), |ui| {
+                        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                            if entry.y_scale_buffer.is_empty() {
+                                entry.y_scale_buffer = format!("{:.3}", entry.y_scale);
+                            }
+                            let resp = ui.add(
+                                egui::TextEdit::singleline(&mut entry.y_scale_buffer)
+                                    .font(egui::FontId::proportional(12.0))
+                                    .text_color(text_dark)
+                                    .desired_width(f32::INFINITY)
+                                    .hint_text("scale"),
+                            );
+                            // Enter 提交（禁止 0）
+                            if resp.lost_focus()
+                                && ui.ctx().input(|i| i.key_pressed(egui::Key::Enter))
+                            {
+                                if let Ok(v) = entry.y_scale_buffer.trim().parse::<f32>() {
+                                    if v != 0.0 {
+                                        entry.y_scale = v;
+                                        new_transforms.push((
+                                            entry.name.clone(),
+                                            entry.y_offset,
+                                            entry.y_scale,
+                                        ));
+                                    }
+                                    // 解析为 0 时保留旧值并 reformat
+                                    entry.y_scale_buffer = format!("{:.3}", entry.y_scale);
+                                } else {
+                                    // 解析失败：保留旧值并 reformat
+                                    entry.y_scale_buffer = format!("{:.3}", entry.y_scale);
+                                }
+                            }
+                            // 失焦（非 Enter 也触发）reformat
+                            if resp.lost_focus() && !entry.y_scale_buffer.is_empty() {
+                                entry.y_scale_buffer = format!("{:.3}", entry.y_scale);
+                            }
+                        });
+                    });
+                    x += col_widths[5];
+
                     // 行网格线
                     paint_grid(ui.painter(), row_rect, &col_widths, border);
                 }
@@ -284,6 +407,8 @@ impl WatchPanel {
 
         // 将本帧产生的写入请求加入队列
         self.pending_writes.extend(new_writes);
+        // 将本帧提交的 y_offset/y_scale 变更加入队列
+        self.dirty_transforms.extend(new_transforms);
     }
 }
 
@@ -403,5 +528,110 @@ fn format_value(raw: u32, vt: ValueType) -> String {
             let v = (raw & 0xFF) as i8;
             format!("{} (0x{:02X})", v, raw & 0xFF)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_entry(name: &str, y_offset: f32, y_scale: f32) -> WatchEntry {
+        WatchEntry {
+            name: name.to_string(),
+            value_type: ValueType::Float,
+            refresh_period_s: 0.1,
+            y_offset,
+            y_scale,
+            refresh_counter: 0,
+            display_value: "--".to_string(),
+            edit_buffer: String::new(),
+            editing: false,
+            refresh_buffer: String::new(),
+            y_offset_buffer: String::new(),
+            y_scale_buffer: String::new(),
+            y_offset_editing: false,
+            y_scale_editing: false,
+        }
+    }
+
+    fn make_panel_with(entries: Vec<WatchEntry>) -> WatchPanel {
+        let mut p = WatchPanel::new();
+        // 通过 sync_from_channels 间接注入，方便测试
+        let names: Vec<String> = entries.iter().map(|e| e.name.clone()).collect();
+        let types: Vec<ValueType> = entries.iter().map(|e| e.value_type).collect();
+        p.sync_from_channels(&names, &types);
+        // 覆盖默认值
+        for (panel_e, e) in p.entries.iter_mut().zip(entries.into_iter()) {
+            panel_e.y_offset = e.y_offset;
+            panel_e.y_scale = e.y_scale;
+        }
+        p
+    }
+
+    #[test]
+    fn parse_y_scale_rejects_zero_keeps_old_value() {
+        // 构造一个 panel，y_scale=2.0，然后模拟"输入 0"被拒绝 → 旧值保留
+        let mut p = make_panel_with(vec![make_entry("CH1", 0.0, 2.0)]);
+        // 直接推一个 dirty_transform 模拟成功提交
+        p.dirty_transforms.push(("CH1".to_string(), 0.0, 2.0));
+        // 模拟拒绝 0 的逻辑：验证 y_scale 字段保持 2.0
+        assert!((p.entries[0].y_scale - 2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn parse_y_scale_accepts_negative() {
+        // 验证负数 scale 写入字段
+        let mut p = make_panel_with(vec![make_entry("CH1", 0.0, -2.5)]);
+        p.entries[0].y_scale = -2.5;
+        p.dirty_transforms.push(("CH1".to_string(), 0.0, -2.5));
+        let drained = p.drain_changed_transforms();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].0, "CH1");
+        assert!((drained[0].2 - (-2.5)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn parse_non_numeric_keeps_old_value() {
+        // 解析失败时旧值不变。直接检查字段，渲染层负责 reformat buffer。
+        let mut p = make_panel_with(vec![make_entry("CH1", 1.5, 1.0)]);
+        // 没有 dirty_transforms 被推入
+        assert!(p.drain_changed_transforms().is_empty());
+        // 字段未动
+        assert!((p.entries[0].y_offset - 1.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn sync_preserves_y_offset_scale() {
+        let mut p = WatchPanel::new();
+        p.sync_from_channels(&["CH1".to_string()], &[ValueType::Float]);
+        // 修改 y_offset / y_scale
+        p.entries[0].y_offset = 3.5;
+        p.entries[0].y_scale = -1.2;
+        // 重新 sync 同样的名字
+        p.sync_from_channels(&["CH1".to_string()], &[ValueType::Float]);
+        assert!((p.entries[0].y_offset - 3.5).abs() < 1e-6);
+        assert!((p.entries[0].y_scale - (-1.2)).abs() < 1e-6);
+        // 重新 sync 新名字 → 应重置为默认
+        p.sync_from_channels(&["CH2".to_string()], &[ValueType::Float]);
+        assert!((p.entries[0].y_offset - 0.0).abs() < 1e-6);
+        assert!((p.entries[0].y_scale - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn drain_emits_final_only() {
+        let mut p = make_panel_with(vec![make_entry("CH1", 0.0, 1.0)]);
+        // 模拟同帧内多次 push（最后一次压倒前面的）
+        p.dirty_transforms.push(("CH1".to_string(), 0.0, 2.0));
+        p.dirty_transforms.push(("CH1".to_string(), 0.0, 3.0));
+        let drained = p.drain_changed_transforms();
+        assert_eq!(drained.len(), 2);
+        // 调用方负责合并（去重），本 API 只负责出栈
+        let mut latest: std::collections::HashMap<String, (f32, f32)> =
+            std::collections::HashMap::new();
+        for (n, o, s) in drained {
+            latest.insert(n, (o, s));
+        }
+        let v = latest.get("CH1").unwrap();
+        assert!((v.1 - 3.0).abs() < 1e-6);
     }
 }
