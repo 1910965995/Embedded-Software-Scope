@@ -191,8 +191,13 @@ impl PipelineEngine {
         let handle = thread::Builder::new()
             .name("dap-collect".into())
             .spawn(move || {
-                let mut buf = vec![0u8; 1024];
+                let mut buf = vec![0u8; 4096];
                 let mut seq: u64 = 0;
+
+                // 每个 DAP_Transfer 响应的固定长度：
+                // [DAP_TRANSFER, count, status, data...] = 3 + 4*num_vars 字节
+                // 每变量一个 u32 读数据（写 TAR 不返回数据）
+                let resp_len = 3 + 4 * num_vars;
 
                 while running.load(Ordering::Relaxed) {
                     // 读取 USB 响应（超时 200ms，允许优雅退出）
@@ -207,51 +212,60 @@ impl PipelineEngine {
                         }
                     };
 
-                    // 解析 DAP_Transfer 响应
-                    let resp = match DapProtocol::parse_transfer_response(&buf[..n]) {
-                        Ok(r) => r,
-                        Err(e) => {
-                            log::error!("接收线程解析失败 (seq={}): {}", seq, e);
+                    // 一次 read_bulk 可能读到多个响应（USB Bulk 合并短包），
+                    // 按 resp_len 循环解析所有响应
+                    let mut offset = 0;
+                    while offset + resp_len <= n {
+                        let chunk = &buf[offset..offset + resp_len];
+                        offset += resp_len;
+
+                        // 解析单个响应
+                        let resp = match DapProtocol::parse_transfer_response(chunk) {
+                            Ok(r) => r,
+                            Err(e) => {
+                                log::error!("接收线程解析失败 (seq={}): {}", seq, e);
+                                // 即使解析失败也要 pop 时间戳，保持与提交线程同步
+                                let _ = ts_queue.lock().ok().and_then(|mut q| q.pop_front());
+                                seq += 1;
+                                continue;
+                            }
+                        };
+
+                        if resp.status != TRANSFER_OK {
+                            log::warn!(
+                                "接收线程收到非 OK 状态 (seq={}): status={}, count={}",
+                                seq, resp.status, resp.count
+                            );
+                            // 非正常状态也 pop 时间戳，保持同步
+                            let _ = ts_queue.lock().ok().and_then(|mut q| q.pop_front());
+                            seq += 1;
                             continue;
                         }
-                    };
 
-                    if resp.status != TRANSFER_OK {
-                        log::warn!(
-                            "接收线程收到非 OK 状态 (seq={}): status={}, count={}",
-                            seq, resp.status, resp.count
-                        );
-                        continue;
+                        // 从提交线程的时间戳队列中取出对应的理想网格时间戳。
+                        let timestamp_sec = ts_queue
+                            .lock()
+                            .ok()
+                            .and_then(|mut q| q.pop_front())
+                            .unwrap_or_else(|| start_time.elapsed().as_secs_f64());
+
+                        let sample = Sample {
+                            seq,
+                            timestamp_sec,
+                            values: resp.data.clone(),
+                        };
+
+                        ring.push(sample);
+                        seq += 1;
                     }
 
-                    // resp.data 中每变量一个 u32（写 TAR 不返回数据，只有读 DRW 返回）
-                    if resp.data.len() != num_vars {
+                    // 如果剩余数据不足一个完整响应，记录警告
+                    if offset < n && n > 0 {
                         log::warn!(
-                            "接收线程数据数量不匹配 (seq={}): 期望 {} 个, 实际 {} 个",
-                            seq, num_vars, resp.data.len()
+                            "接收线程剩余 {} 字节未解析（不完整响应）",
+                            n - offset
                         );
-                        continue;
                     }
-
-                    // 从提交线程的时间戳队列中取出对应的理想网格时间戳。
-                    // 时间戳 = seq * interval_us，完全由采样率决定，
-                    // 不受 USB 写入/响应抖动影响，保证显示间隔严格一致。
-                    // 提交线程和接收线程通过 USB FIFO 自然保持同步
-                    //（每条写入对应一条响应）。
-                    let timestamp_sec = ts_queue
-                        .lock()
-                        .ok()
-                        .and_then(|mut q| q.pop_front())
-                        .unwrap_or_else(|| start_time.elapsed().as_secs_f64());
-
-                    let sample = Sample {
-                        seq,
-                        timestamp_sec,
-                        values: resp.data.clone(),
-                    };
-
-                    ring.push(sample);
-                    seq += 1;
                 }
 
                 log::info!("接收线程退出，共接收 {} 个采样点", seq);

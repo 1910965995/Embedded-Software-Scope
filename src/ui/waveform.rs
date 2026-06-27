@@ -86,7 +86,9 @@ pub struct WaveformPanel {
     last_x_range: Option<f64>,
     /// 上一帧的 X 轴右边界，用于检测用户拖拽/缩放
     last_x_max: Option<f64>,
-    /// 是否需要自动调整 Y 轴范围
+    /// 当前缓冲区数据的绝对值最大值（Y 轴自适应用）
+    auto_y_max_abs: f64,
+    /// 是否自动调整 Y 轴范围（跟随模式下持续生效）
     auto_fit_y: bool,
     /// 是否自动滚动跟随最新数据
     auto_scroll: bool,
@@ -116,6 +118,7 @@ impl WaveformPanel {
             cache_buffer_len: 0,
             last_x_range: None,
             last_x_max: None,
+            auto_y_max_abs: 1.0,
             auto_fit_y: true, // 首次渲染自动调整 Y 轴
             auto_scroll: true,
             display_mode,
@@ -190,9 +193,9 @@ impl WaveformPanel {
         let auto_scroll = self.auto_scroll;
         let mut clicked_seq: Option<u64> = None;
         let auto_fit = self.auto_fit_y;
-        self.auto_fit_y = false; // 一次性触发
+        self.auto_fit_y = false; // 一次性触发（首次渲染或用户点击 Auto Fit Y）
 
-        let mut plot = Plot::new("waveform_plot")
+        let plot = Plot::new("waveform_plot")
             .legend(Legend::default())
             .show_grid(true)
             .show_axes(true)
@@ -202,9 +205,7 @@ impl WaveformPanel {
             .allow_drag(true)
             .allow_scroll(true);
 
-        if auto_fit {
-            plot = plot.auto_bounds(egui::Vec2b::new(true, true));
-        }
+        // 不使用 plot.auto_bounds，改用自定义 Y 轴范围控制
 
         // 准备自动滚动参数
         let interval_us = self.interval_us;
@@ -212,6 +213,10 @@ impl WaveformPanel {
         let latest_ts = buffer.last().map(|s| s.timestamp_sec).unwrap_or(0.0);
         // 记录上一帧的 X 轴右边界，用于检测用户是否拖拽/缩放
         let prev_x_max = self.last_x_max;
+
+        // Y 轴自适应范围：[-2*max_abs, 2*max_abs]
+        let y_max = self.auto_y_max_abs;
+        let y_bound = 2.0 * y_max;
 
         let plot_response = plot.show(ui, |plot_ui| {
             let cur_bounds = plot_ui.plot_bounds();
@@ -230,16 +235,23 @@ impl WaveformPanel {
                 }
             }
 
-            // 自动滚动：仅在 auto_scroll 开启时设置 X 轴范围
-            // Y 轴范围始终由用户/缩放控制，不覆盖
+            // 自动滚动：X 轴跟随最新数据，Y 轴自适应 [-2*max, 2*max]
             if auto_scroll && buffer_len > 0 {
                 let window_duration = buffer_len as f64 * interval_us / 1_000_000.0;
                 let new_bounds = PlotBounds::from_min_max(
-                    [latest_ts - window_duration, cur_bounds.min()[1]],
-                    [latest_ts, cur_bounds.max()[1]],
+                    [latest_ts - window_duration, -y_bound],
+                    [latest_ts, y_bound],
                 );
                 plot_ui.set_plot_bounds(new_bounds);
                 self.last_x_max = Some(latest_ts);
+            } else if auto_fit {
+                // 非 Follow 模式下点击 Auto Fit Y：只调整 Y 轴，保留当前 X 轴范围
+                let new_bounds = PlotBounds::from_min_max(
+                    [cur_bounds.min()[0], -y_bound],
+                    [cur_bounds.max()[0], y_bound],
+                );
+                plot_ui.set_plot_bounds(new_bounds);
+                self.last_x_max = Some(cur_x_max);
             } else {
                 self.last_x_max = Some(cur_x_max);
             }
@@ -314,7 +326,11 @@ impl WaveformPanel {
     }
 
     /// 重建降采样缓存
+    ///
+    /// 同时计算所有可见通道数据的绝对值最大值，用于 Y 轴自适应。
     fn rebuild_cache(&mut self, buffer: &[Sample], target_points: usize) {
+        let mut y_max_abs: f64 = 0.0;
+
         for (ch_idx, ch) in self.channels.iter().enumerate() {
             if !ch.visible {
                 self.cached_points[ch_idx].clear();
@@ -323,13 +339,17 @@ impl WaveformPanel {
 
             let vt = self.value_types.get(ch_idx).copied().unwrap_or(ValueType::Float);
 
-            // 构建 [x, y] 数据点序列
+            // 构建 [x, y] 数据点序列，同时追踪绝对值最大值
             let raw_points: Vec<[f64; 2]> = buffer
                 .iter()
                 .filter_map(|s| {
                     let raw = s.values.get(ch_idx).copied().unwrap_or(0);
                     let val = vt.to_f64(raw);
                     if val.is_finite() {
+                        let abs_val = val.abs();
+                        if abs_val > y_max_abs {
+                            y_max_abs = abs_val;
+                        }
                         Some([s.timestamp_sec, val])
                     } else {
                         None
@@ -357,6 +377,9 @@ impl WaveformPanel {
                 .map(PlotPoint::from)
                 .collect();
         }
+
+        // 更新 Y 轴绝对值最大值（避免为 0 导致范围无效）
+        self.auto_y_max_abs = if y_max_abs > 0.0 { y_max_abs } else { 1.0 };
     }
 
     /// 切换通道可见性

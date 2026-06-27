@@ -182,7 +182,10 @@ impl DapProtocol {
     }
 
     /// 解析 DAP_Transfer 响应
+    ///
     /// CMSIS-DAP v2 格式: [命令回显(0x05), 计数, 状态, 数据(每读操作4字节)...]
+    /// 注意：调用方应传入恰好一个响应长度的数据（3 + 4*num_read_vars 字节）。
+    /// 接收线程按 resp_len 切片后调用此方法，避免多个响应被当作一个解析。
     pub fn parse_transfer_response(data: &[u8]) -> Result<TransferResponse> {
         if data.len() < 3 {
             return Err(Error::InvalidResponse(format!(
@@ -194,13 +197,18 @@ impl DapProtocol {
         let status = data[2];  // 执行状态
 
         // 读返回数据：从 byte 3 开始，每 4 字节一个 u32
+        // 只解析 data 中实际存在的完整 u32（调用方已按 resp_len 切片）
         let data_bytes = &data[3..];
         let num_values = data_bytes.len() / 4;
         let mut values = Vec::with_capacity(num_values);
 
         for i in 0..num_values {
             let offset = i * 4;
-            let bytes: [u8; 4] = data_bytes[offset..offset + 4].try_into()
+            if offset + 4 > data_bytes.len() {
+                break;
+            }
+            let bytes: [u8; 4] = data_bytes[offset..offset + 4]
+                .try_into()
                 .map_err(|_| Error::InvalidResponse("数据解析错误".into()))?;
             values.push(u32::from_le_bytes(bytes));
         }

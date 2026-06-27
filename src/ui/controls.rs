@@ -33,7 +33,7 @@ pub struct ControlPanel {
 
 /// 采样率范围
 pub const RATE_MIN: u32 = 1;
-pub const RATE_MAX: u32 = 30_000;
+pub const RATE_MAX: u32 = 15_000;
 /// 窗口大小范围
 pub const WINDOW_MIN: usize = 1;
 pub const WINDOW_MAX: usize = 10_000;
