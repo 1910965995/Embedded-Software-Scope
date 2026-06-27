@@ -78,7 +78,11 @@ impl WatchPanel {
         }
     }
 
-    /// 渲染 Watch 面板
+    /// 渲染 Watch 面板（表格形式）
+    ///
+    /// 使用 egui::Grid 而非 egui_extras::TableBuilder，避免 TableBuilder 内部
+    /// ScrollArea 的 min/max scrolled height 与 TopBottomPanel resize 形成循环
+    /// 依赖，导致面板高度无法手动调整。
     pub fn show(&mut self, ui: &mut egui::Ui) {
         if self.entries.is_empty() {
             ui.label("暂无 Watch 变量");
@@ -86,45 +90,60 @@ impl WatchPanel {
             return;
         }
 
-        ui.label(format!("Watch 变量: {} 个", self.entries.len()));
+        // 表头（固定不滚动）
+        egui::Grid::new("watch_header")
+            .num_columns(4)
+            .striped(false)
+            .spacing([12.0, 4.0])
+            .show(ui, |ui| {
+                ui.strong("Name");
+                ui.strong("Type");
+                ui.strong("Value");
+                ui.strong("Refresh");
+                ui.end_row();
+            });
+
         ui.separator();
 
+        // 数据行（可滚动）
         egui::ScrollArea::vertical()
-            .id_salt("watch_scroll")
+            .id_salt("watch_body")
+            .auto_shrink([false, false])
             .show(ui, |ui| {
-                for entry in self.entries.iter_mut() {
-                    ui.horizontal(|ui| {
-                        // 变量名
-                        ui.label(&entry.name);
-                        ui.separator();
+                egui::Grid::new("watch_body")
+                    .num_columns(4)
+                    .striped(true)
+                    .spacing([12.0, 4.0])
+                    .show(ui, |ui| {
+                        for entry in self.entries.iter_mut() {
+                            // 变量名
+                            ui.label(&entry.name);
 
-                        // 类型
-                        ui.label(
-                            egui::RichText::new(format!("[{}]", entry.value_type.label()))
-                                .small()
-                                .color(egui::Color32::from_rgb(100, 180, 255)),
-                        );
-                        ui.separator();
+                            // 类型
+                            ui.label(
+                                egui::RichText::new(entry.value_type.label())
+                                    .small()
+                                    .color(egui::Color32::from_rgb(100, 180, 255)),
+                            );
 
-                        // 当前值
-                        ui.label(
-                            egui::RichText::new(&entry.display_value)
-                                .color(egui::Color32::from_rgb(255, 220, 100))
-                                .monospace(),
-                        );
+                            // 当前值
+                            ui.label(
+                                egui::RichText::new(&entry.display_value)
+                                    .color(egui::Color32::from_rgb(255, 220, 100))
+                                    .monospace(),
+                            );
 
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             // 刷新周期
-                            ui.label("Refresh:");
                             ui.add(
                                 egui::DragValue::new(&mut entry.refresh_period)
                                     .range(1..=10000)
                                     .speed(0.1)
                                     .suffix(" pt"),
                             );
-                        });
+
+                            ui.end_row();
+                        }
                     });
-                }
             });
     }
 }

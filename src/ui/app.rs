@@ -138,9 +138,9 @@ impl DapSamplerApp {
             variable_browser: VariableBrowser::new(),
             channel_panel,
             watch_panel,
-            var_browser_open: false,
-            channels_open: false,
-            cursor_open: false,
+            var_browser_open: true,
+            channels_open: true,
+            cursor_open: true,
             manual_channel_names,
             manual_value_types,
             rate_hz,
@@ -566,11 +566,9 @@ impl eframe::App for DapSamplerApp {
         // ---- 底部 Watch 面板 ----
         egui::TopBottomPanel::bottom("watch_panel")
             .resizable(true)
-            .default_height(130.0)
-            .min_height(70.0)
+            .default_height(140.0)
+            .min_height(60.0)
             .show(ctx, |ui| {
-                ui.heading("Watch");
-                ui.separator();
                 self.watch_panel.show(ui);
             });
 
