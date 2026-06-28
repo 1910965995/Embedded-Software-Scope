@@ -121,7 +121,7 @@ impl DapSamplerApp {
         // 初始化 Watch 面板
         let mut watch_panel = WatchPanel::new();
         if !manual_channel_names.is_empty() {
-            watch_panel.sync_from_channels(&manual_channel_names, &manual_value_types);
+            watch_panel.sync_from_channels(&manual_channel_names, &manual_value_types, &manual_addresses);
         }
 
         Self {
@@ -235,7 +235,7 @@ impl DapSamplerApp {
         self.controls.update_count(0);
 
         // 同步 Watch 面板
-        self.watch_panel.sync_from_channels(&channel_names, &types);
+        self.watch_panel.sync_from_channels(&channel_names, &types, &self.current_addresses);
 
         // 6. 启动采集
         match engine.start() {
@@ -416,7 +416,28 @@ impl DapSamplerApp {
         // 同步 Watch 面板
         let names: Vec<String> = self.channel_panel.channels.iter().map(|c| c.name.clone()).collect();
         let types: Vec<ValueType> = self.channel_panel.channels.iter().map(|c| c.value_type).collect();
-        self.watch_panel.sync_from_channels(&names, &types);
+        let addresses = self.collect_channel_addresses();
+        self.watch_panel.sync_from_channels(&names, &types, &addresses);
+    }
+
+    /// 从 elf_ctx 中收集当前 channel_panel 各通道对应的地址。
+    /// 手工模式下使用 manual_addresses。
+    fn collect_channel_addresses(&self) -> Vec<u32> {
+        if !self.manual_addresses.is_empty() {
+            return self.manual_addresses.clone();
+        }
+        self.channel_panel
+            .channels
+            .iter()
+            .filter_map(|ch| {
+                self.elf_ctx.as_ref().and_then(|ctx| {
+                    ctx.variables
+                        .iter()
+                        .find(|v| v.path == ch.name || v.name == ch.name)
+                        .map(|v| v.address)
+                })
+            })
+            .collect()
     }
 
     fn sync_channel_visibility(&mut self) {
@@ -602,7 +623,8 @@ impl eframe::App for DapSamplerApp {
                                     // 同步 Watch 面板
                                     let names: Vec<String> = self.channel_panel.channels.iter().map(|c| c.name.clone()).collect();
                                     let types: Vec<ValueType> = self.channel_panel.channels.iter().map(|c| c.value_type).collect();
-                                    self.watch_panel.sync_from_channels(&names, &types);
+                                    let addresses = self.collect_channel_addresses();
+                                    self.watch_panel.sync_from_channels(&names, &types, &addresses);
                                 }
                             });
 

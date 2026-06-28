@@ -10,6 +10,8 @@ pub struct WriteRequest {
 pub struct WatchEntry {
     /// 变量名（ELF 模式为 path，手工模式为 "CH1 0x..."）
     pub name: String,
+    /// 变量地址（0 表示未知）
+    pub address: u32,
     /// 变量类型
     pub value_type: ValueType,
     /// 刷新周期（秒）
@@ -18,6 +20,8 @@ pub struct WatchEntry {
     pub y_offset: f32,
     /// Y 轴缩放系数（用于波形图，默认 1.0；禁止 0；允许负数）
     pub y_scale: f32,
+    /// 用户自定义备注（描述通道的变量）
+    pub remark: String,
     /// 内部计数器（累计采样点数）
     refresh_counter: u32,
     /// 当前显示的值（格式化字符串）
@@ -36,16 +40,23 @@ pub struct WatchEntry {
     y_offset_editing: bool,
     /// Y Scale 输入框是否获得焦点
     y_scale_editing: bool,
+    /// Remark 输入框文本
+    remark_buffer: String,
 }
+
+/// 默认列宽 (px): Name | Address | Type | Value | Refresh (s) | Y Offset | Y Scale | Remark
+const DEFAULT_COL_WIDTHS: [f32; 8] = [130.0, 112.5, 70.0, 130.0, 80.0, 120.0, 120.0, 240.0];
 
 /// Watch 面板（示波器下方）
 ///
 /// 显示已添加到示波器的变量列表，包含：
 /// - 变量名称
+/// - 变量地址
 /// - 变量类型
 /// - 变量当前值（可编辑，回车后写入 MCU）
 /// - 可配置的刷新周期
 /// - 可配置的 Y Offset / Y Scale（应用于波形图）
+/// - 用户自定义备注
 pub struct WatchPanel {
     /// 变量列表
     pub entries: Vec<WatchEntry>,
@@ -65,11 +76,11 @@ impl WatchPanel {
     }
 
     /// 设置 Watch 列表（与示波器通道同步）
-    /// names: 变量名列表, types: 变量类型列表
-    /// 保留同名条目的 refresh_period_s / display_value / y_offset / y_scale
-    pub fn sync_from_channels(&mut self, names: &[String], types: &[ValueType]) {
-        // 保留已有的 refresh_period_s / display_value / y_offset / y_scale
-        let old_entries: Vec<(String, f32, f32, f32, String)> = self.entries
+    /// names: 变量名列表, types: 变量类型列表, addresses: 变量地址列表
+    /// 保留同名条目的 refresh_period_s / display_value / y_offset / y_scale / remark
+    pub fn sync_from_channels(&mut self, names: &[String], types: &[ValueType], addresses: &[u32]) {
+        // 保留已有的 refresh_period_s / display_value / y_offset / y_scale / remark
+        let old_entries: Vec<(String, f32, f32, f32, String, String)> = self.entries
             .iter()
             .map(|e| (
                 e.name.clone(),
@@ -77,6 +88,7 @@ impl WatchPanel {
                 e.y_offset,
                 e.y_scale,
                 e.display_value.clone(),
+                e.remark.clone(),
             ))
             .collect();
 
@@ -85,18 +97,21 @@ impl WatchPanel {
             .enumerate()
             .map(|(i, name)| {
                 let vt = types.get(i).copied().unwrap_or(ValueType::Uint32);
-                // 尝试保留旧配置
-                let (period, y_offset, y_scale, display) = old_entries
+                let addr = addresses.get(i).copied().unwrap_or(0);
+                // 尝试保留旧配置(含 remark)
+                let (period, y_offset, y_scale, display, remark) = old_entries
                     .iter()
-                    .find(|(n, _, _, _, _)| n == name)
-                    .map(|(_, p, o, s, d)| (*p, *o, *s, d.clone()))
-                    .unwrap_or((0.1, 0.0, 1.0, "--".to_string()));
+                    .find(|(n, _, _, _, _, _)| n == name)
+                    .map(|(_, p, o, s, d, r)| (*p, *o, *s, d.clone(), r.clone()))
+                    .unwrap_or((0.1, 0.0, 1.0, "--".to_string(), String::new()));
                 WatchEntry {
                     name: name.clone(),
+                    address: addr,
                     value_type: vt,
                     refresh_period_s: period,
                     y_offset,
                     y_scale,
+                    remark,
                     refresh_counter: 0,
                     display_value: display,
                     edit_buffer: String::new(),
@@ -106,6 +121,7 @@ impl WatchPanel {
                     y_scale_buffer: String::new(),
                     y_offset_editing: false,
                     y_scale_editing: false,
+                    remark_buffer: String::new(),
                 }
             })
             .collect();
@@ -150,7 +166,7 @@ impl WatchPanel {
             return;
         }
 
-        let col_widths: [f32; 6] = [130.0, 70.0, 150.0, 80.0, 80.0, 80.0];
+        let col_widths: [f32; 8] = DEFAULT_COL_WIDTHS;
         let row_h = 24.0;
         let header_h = 26.0;
         let total_w: f32 = col_widths.iter().sum();
@@ -167,7 +183,7 @@ impl WatchPanel {
         // 收集本帧提交的 y_offset/y_scale 变更（用局部缓冲避开 self 的可变借用冲突）
         let mut new_transforms: Vec<(String, f32, f32)> = Vec::new();
 
-        egui::ScrollArea::vertical()
+        egui::ScrollArea::both()
             .id_salt("watch_table_scroll")
             .auto_shrink([false, false])
             .show_viewport(ui, |ui, _viewport| {
@@ -177,7 +193,7 @@ impl WatchPanel {
                     egui::Sense::hover(),
                 );
                 ui.painter().rect_filled(hdr_rect, 0.0, header_bg);
-                let headers = ["Name", "Type", "Value", "Refresh", "Y Offset", "Y Scale"];
+                let headers = ["Name", "Address", "Type", "Value", "Refresh (s)", "Y Offset", "Y Scale", "Remark"];
                 let mut x = hdr_rect.left();
                 for (i, h) in headers.iter().enumerate() {
                     let cell = egui::Rect::from_min_size(
@@ -223,10 +239,29 @@ impl WatchPanel {
                     );
                     x += col_widths[0];
 
-                    // Type
+                    // Address (只读显示, 16 进制)
                     let r = egui::Rect::from_min_size(
                         egui::Pos2::new(x, row_rect.top()),
                         egui::Vec2::new(col_widths[1], row_h),
+                    );
+                    let addr_str = if entry.address == 0 {
+                        "--".to_string()
+                    } else {
+                        format!("0x{:08X}", entry.address)
+                    };
+                    ui.painter().text(
+                        r.left_center() + egui::Vec2::new(8.0, 0.0),
+                        egui::Align2::LEFT_CENTER,
+                        addr_str,
+                        egui::FontId::proportional(12.0),
+                        text_dark,
+                    );
+                    x += col_widths[1];
+
+                    // Type
+                    let r = egui::Rect::from_min_size(
+                        egui::Pos2::new(x, row_rect.top()),
+                        egui::Vec2::new(col_widths[2], row_h),
                     );
                     ui.painter().text(
                         r.left_center() + egui::Vec2::new(8.0, 0.0),
@@ -235,12 +270,12 @@ impl WatchPanel {
                         egui::FontId::proportional(12.0),
                         text_dark,
                     );
-                    x += col_widths[1];
+                    x += col_widths[2];
 
                     // Value（可编辑文本框）
                     let r = egui::Rect::from_min_size(
                         egui::Pos2::new(x, row_rect.top()),
-                        egui::Vec2::new(col_widths[2], row_h),
+                        egui::Vec2::new(col_widths[3], row_h),
                     );
                     let cell_inset = r.shrink2(egui::Vec2::new(4.0, 1.0));
                     ui.allocate_new_ui(egui::UiBuilder::new().max_rect(cell_inset), |ui| {
@@ -250,7 +285,12 @@ impl WatchPanel {
                                     .font(egui::FontId::proportional(12.0))
                                     .text_color(text_dark)
                                     .desired_width(f32::INFINITY)
-                                    .hint_text(&entry.display_value),
+                                    .hint_text(
+                                        egui::RichText::new(&entry.display_value)
+                                            .color(text_dark)
+                                            .family(egui::FontFamily::Proportional)
+                                            .size(12.0),
+                                    ),
                             );
 
                             if resp.lost_focus()
@@ -277,12 +317,12 @@ impl WatchPanel {
                             }
                         });
                     });
-                    x += col_widths[2];
+                    x += col_widths[3];
 
                     // Refresh（文本输入框，单位秒）
                     let r = egui::Rect::from_min_size(
                         egui::Pos2::new(x, row_rect.top()),
-                        egui::Vec2::new(col_widths[3], row_h),
+                        egui::Vec2::new(col_widths[4], row_h),
                     );
                     let cell_inset = r.shrink2(egui::Vec2::new(4.0, 1.0));
                     ui.allocate_new_ui(egui::UiBuilder::new().max_rect(cell_inset), |ui| {
@@ -312,12 +352,12 @@ impl WatchPanel {
                             }
                         });
                     });
-                    x += col_widths[3];
+                    x += col_widths[4];
 
                     // Y Offset（文本输入框）
                     let r = egui::Rect::from_min_size(
                         egui::Pos2::new(x, row_rect.top()),
-                        egui::Vec2::new(col_widths[4], row_h),
+                        egui::Vec2::new(col_widths[5], row_h),
                     );
                     let cell_inset = r.shrink2(egui::Vec2::new(4.0, 1.0));
                     ui.allocate_new_ui(egui::UiBuilder::new().max_rect(cell_inset), |ui| {
@@ -352,12 +392,12 @@ impl WatchPanel {
                             }
                         });
                     });
-                    x += col_widths[4];
+                    x += col_widths[5];
 
                     // Y Scale（文本输入框，禁止 0）
                     let r = egui::Rect::from_min_size(
                         egui::Pos2::new(x, row_rect.top()),
-                        egui::Vec2::new(col_widths[5], row_h),
+                        egui::Vec2::new(col_widths[6], row_h),
                     );
                     let cell_inset = r.shrink2(egui::Vec2::new(4.0, 1.0));
                     ui.allocate_new_ui(egui::UiBuilder::new().max_rect(cell_inset), |ui| {
@@ -398,7 +438,36 @@ impl WatchPanel {
                             }
                         });
                     });
-                    x += col_widths[5];
+                    x += col_widths[6];
+
+                    // Remark（用户自定义备注, 可编辑文本框, 不参与写入 MCU）
+                    let r = egui::Rect::from_min_size(
+                        egui::Pos2::new(x, row_rect.top()),
+                        egui::Vec2::new(col_widths[7], row_h),
+                    );
+                    let cell_inset = r.shrink2(egui::Vec2::new(4.0, 1.0));
+                    ui.allocate_new_ui(egui::UiBuilder::new().max_rect(cell_inset), |ui| {
+                        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                            let resp = ui.add(
+                                egui::TextEdit::singleline(&mut entry.remark_buffer)
+                                    .font(egui::FontId::proportional(12.0))
+                                    .text_color(text_dark)
+                                    .desired_width(f32::INFINITY)
+                                    .hint_text(&entry.remark),
+                            );
+                            // Enter 或失焦时把 buffer 写入 remark
+                            if (resp.lost_focus()
+                                && ui.ctx().input(|i| i.key_pressed(egui::Key::Enter)))
+                                || resp.lost_focus()
+                            {
+                                if !entry.remark_buffer.is_empty() {
+                                    entry.remark = entry.remark_buffer.clone();
+                                    entry.remark_buffer.clear();
+                                }
+                            }
+                        });
+                    });
+                    x += col_widths[7];
 
                     // 行网格线
                     paint_grid(ui.painter(), row_rect, &col_widths, border);
@@ -429,13 +498,14 @@ fn paint_grid(painter: &egui::Painter, rect: egui::Rect, col_widths: &[f32], str
 
 /// 解析用户输入的值字符串，返回原始 u32
 ///
+/// 用户输入按 10 进制处理（不支持 0x 前缀）。
 /// 支持格式：
 /// - Float: "3.14", "-1.5"
-/// - Uint32: "0x12345678", "1000"
-/// - Int32: "-100", "0xFF"
-/// - Uint16: "0x1234", "1000"
+/// - Uint32: "1000"
+/// - Int32: "-100"
+/// - Uint16: "1000"
 /// - Int16: "-100"
-/// - Uint8: "0xFF", "200"
+/// - Uint8: "200"
 /// - Int8: "-1"
 fn parse_value(s: &str, vt: ValueType) -> Option<u32> {
     let s = s.trim();
@@ -448,61 +518,31 @@ fn parse_value(s: &str, vt: ValueType) -> Option<u32> {
             let f: f32 = s.parse().ok()?;
             Some(f.to_bits())
         }
-        ValueType::Uint32 => parse_int(s, 0xFFFFFFFF, 0),
+        ValueType::Uint32 => s.parse::<u32>().ok(),
         ValueType::Int32 => {
-            let v: i32 = if s.starts_with("0x") || s.starts_with("0X") {
-                i32::from_str_radix(&s[2..], 16).ok()?
-            } else {
-                s.parse().ok()?
-            };
+            let v: i32 = s.parse().ok()?;
             Some(v as u32)
         }
         ValueType::Uint16 => {
-            let v = if s.starts_with("0x") || s.starts_with("0X") {
-                u16::from_str_radix(&s[2..], 16).ok()?
-            } else {
-                s.parse().ok()?
-            };
+            let v: u16 = s.parse().ok()?;
             Some(v as u32)
         }
         ValueType::Int16 => {
-            let v: i16 = if s.starts_with("0x") || s.starts_with("0X") {
-                i16::from_str_radix(&s[2..], 16).ok()?
-            } else {
-                s.parse().ok()?
-            };
+            let v: i16 = s.parse().ok()?;
             Some(v as u32)
         }
         ValueType::Uint8 => {
-            let v = if s.starts_with("0x") || s.starts_with("0X") {
-                u8::from_str_radix(&s[2..], 16).ok()?
-            } else {
-                s.parse().ok()?
-            };
+            let v: u8 = s.parse().ok()?;
             Some(v as u32)
         }
         ValueType::Int8 => {
-            let v: i8 = if s.starts_with("0x") || s.starts_with("0X") {
-                i8::from_str_radix(&s[2..], 16).ok()?
-            } else {
-                s.parse().ok()?
-            };
+            let v: i8 = s.parse().ok()?;
             Some(v as u32)
         }
     }
 }
 
-/// 解析无符号整数
-fn parse_int(s: &str, _max: u32, _min: u32) -> Option<u32> {
-    let s = s.trim();
-    if s.starts_with("0x") || s.starts_with("0X") {
-        u32::from_str_radix(&s[2..], 16).ok()
-    } else {
-        s.parse().ok()
-    }
-}
-
-/// 格式化变量值
+/// 格式化变量值（只显示 10 进制）
 fn format_value(raw: u32, vt: ValueType) -> String {
     match vt {
         ValueType::Float => {
@@ -513,21 +553,12 @@ fn format_value(raw: u32, vt: ValueType) -> String {
                 "NaN/Inf".to_string()
             }
         }
-        ValueType::Uint32 => format!("0x{:08X} ({})", raw, raw),
-        ValueType::Int32 => {
-            let v = raw as i32;
-            format!("{} (0x{:08X})", v, raw)
-        }
-        ValueType::Uint16 => format!("0x{:04X} ({})", raw & 0xFFFF, raw & 0xFFFF),
-        ValueType::Int16 => {
-            let v = (raw & 0xFFFF) as i16;
-            format!("{} (0x{:04X})", v, raw & 0xFFFF)
-        }
-        ValueType::Uint8 => format!("0x{:02X} ({})", raw & 0xFF, raw & 0xFF),
-        ValueType::Int8 => {
-            let v = (raw & 0xFF) as i8;
-            format!("{} (0x{:02X})", v, raw & 0xFF)
-        }
+        ValueType::Uint32 => format!("{}", raw),
+        ValueType::Int32 => format!("{}", raw as i32),
+        ValueType::Uint16 => format!("{}", raw & 0xFFFF),
+        ValueType::Int16 => format!("{}", (raw & 0xFFFF) as i16),
+        ValueType::Uint8 => format!("{}", raw & 0xFF),
+        ValueType::Int8 => format!("{}", (raw & 0xFF) as i8),
     }
 }
 
@@ -538,10 +569,12 @@ mod tests {
     fn make_entry(name: &str, y_offset: f32, y_scale: f32) -> WatchEntry {
         WatchEntry {
             name: name.to_string(),
+            address: 0,
             value_type: ValueType::Float,
             refresh_period_s: 0.1,
             y_offset,
             y_scale,
+            remark: String::new(),
             refresh_counter: 0,
             display_value: "--".to_string(),
             edit_buffer: String::new(),
@@ -551,6 +584,7 @@ mod tests {
             y_scale_buffer: String::new(),
             y_offset_editing: false,
             y_scale_editing: false,
+            remark_buffer: String::new(),
         }
     }
 
@@ -559,7 +593,8 @@ mod tests {
         // 通过 sync_from_channels 间接注入，方便测试
         let names: Vec<String> = entries.iter().map(|e| e.name.clone()).collect();
         let types: Vec<ValueType> = entries.iter().map(|e| e.value_type).collect();
-        p.sync_from_channels(&names, &types);
+        let addresses: Vec<u32> = entries.iter().map(|e| e.address).collect();
+        p.sync_from_channels(&names, &types, &addresses);
         // 覆盖默认值
         for (panel_e, e) in p.entries.iter_mut().zip(entries.into_iter()) {
             panel_e.y_offset = e.y_offset;
@@ -603,16 +638,16 @@ mod tests {
     #[test]
     fn sync_preserves_y_offset_scale() {
         let mut p = WatchPanel::new();
-        p.sync_from_channels(&["CH1".to_string()], &[ValueType::Float]);
+        p.sync_from_channels(&["CH1".to_string()], &[ValueType::Float], &[0]);
         // 修改 y_offset / y_scale
         p.entries[0].y_offset = 3.5;
         p.entries[0].y_scale = -1.2;
         // 重新 sync 同样的名字
-        p.sync_from_channels(&["CH1".to_string()], &[ValueType::Float]);
+        p.sync_from_channels(&["CH1".to_string()], &[ValueType::Float], &[0]);
         assert!((p.entries[0].y_offset - 3.5).abs() < 1e-6);
         assert!((p.entries[0].y_scale - (-1.2)).abs() < 1e-6);
         // 重新 sync 新名字 → 应重置为默认
-        p.sync_from_channels(&["CH2".to_string()], &[ValueType::Float]);
+        p.sync_from_channels(&["CH2".to_string()], &[ValueType::Float], &[0]);
         assert!((p.entries[0].y_offset - 0.0).abs() < 1e-6);
         assert!((p.entries[0].y_scale - 1.0).abs() < 1e-6);
     }
