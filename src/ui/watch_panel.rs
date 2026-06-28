@@ -162,7 +162,7 @@ impl WatchPanel {
     /// 渲染 Watch 面板（Excel 风格带边框表格）
     pub fn show(&mut self, ui: &mut egui::Ui) {
         if self.entries.is_empty() {
-            ui.label("暂无 Watch 变量");
+            ui.label("No watch variables");
             return;
         }
 
