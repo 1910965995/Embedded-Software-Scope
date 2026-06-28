@@ -449,7 +449,7 @@ impl DapSamplerApp {
 
     fn show_cursor_info(&mut self, ui: &mut egui::Ui) {
         ui.label(
-            egui::RichText::new("点击波形放置光标 1\n再次点击放置光标 2")
+            egui::RichText::new("Click waveform to place cursor 1\nClick again to place cursor 2")
                 .small()
                 .color(egui::Color32::from_rgb(0x8b, 0x94, 0x9e)),
         );
@@ -594,7 +594,7 @@ impl eframe::App for DapSamplerApp {
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         // --- 变量浏览器模块 ---
-                        egui::CollapsingHeader::new("变量浏览器")
+                        egui::CollapsingHeader::new("Variables")
                             .default_open(self.var_browser_open)
                             .id_salt("var_browser_header")
                             .show(ui, |ui| {
@@ -611,7 +611,7 @@ impl eframe::App for DapSamplerApp {
 
                         // --- 通道模块 ---
                         egui::CollapsingHeader::new(
-                            format!("通道 ({}/8)", self.channel_panel.channel_count())
+                            format!("Channels ({}/8)", self.channel_panel.channel_count())
                         )
                             .default_open(self.channels_open)
                             .id_salt("channels_header")
@@ -631,7 +631,7 @@ impl eframe::App for DapSamplerApp {
                         ui.separator();
 
                         // --- 光标模块 ---
-                        egui::CollapsingHeader::new("光标")
+                        egui::CollapsingHeader::new("Cursor")
                             .default_open(self.cursor_open)
                             .id_salt("cursor_header")
                             .show(ui, |ui| {

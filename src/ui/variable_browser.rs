@@ -26,7 +26,7 @@ impl VariableBrowser {
         elf_ctx: Option<&ElfContext>,
     ) -> Vec<(String, bool)> {
         if elf_ctx.is_none() {
-            ui.label("未加载 ELF 文件");
+            ui.label("No ELF file loaded");
             return vec![];
         }
 
@@ -36,18 +36,18 @@ impl VariableBrowser {
         // 搜索框
         ui.add(
             egui::TextEdit::singleline(&mut self.search_text)
-                .hint_text("🔍 搜索变量名或地址..."),
+                .hint_text("🔍 Search variable name..."),
         );
         ui.add_space(4.0);
 
         // 统计信息
         let total = ctx.variables.len();
         let checked_count = self.checked_paths.len();
-        ui.label(format!("变量: {} 个 | 已选: {} 个", total, checked_count));
+        ui.label(format!("Variables: {} | Selected: {}", total, checked_count));
 
         ui.separator();
 
-        // 构建过滤后的显示列表
+        // 构建过滤后的显示列表（仅按变量名搜索）
         let filtered: Vec<&ElfVariable> = if self.search_text.is_empty() {
             ctx.variables.iter().collect()
         } else {
@@ -57,7 +57,6 @@ impl VariableBrowser {
                 .filter(|v| {
                     v.name.to_lowercase().contains(&lower)
                         || v.path.to_lowercase().contains(&lower)
-                        || format!("0x{:x}", v.address).contains(&lower)
                 })
                 .collect()
         };
@@ -74,7 +73,7 @@ impl VariableBrowser {
                     let group = var
                         .source_file
                         .clone()
-                        .unwrap_or_else(|| "全局变量".to_string());
+                        .unwrap_or_else(|| "Globals".to_string());
 
                     if current_group.as_deref() != Some(&group) {
                         current_group = Some(group.clone());
