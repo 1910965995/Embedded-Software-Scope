@@ -643,8 +643,8 @@ impl eframe::App for DapSamplerApp {
         // ---- 底部 Watch 面板 ----
         egui::TopBottomPanel::bottom("watch_panel")
             .resizable(true)
-            .default_height(140.0)
-            .min_height(60.0)
+            .default_height(180.0)
+            .min_height(180.0)
             .show(ctx, |ui| {
                 self.watch_panel.show(ui);
             });
