@@ -36,10 +36,6 @@ pub struct WatchEntry {
     y_offset_buffer: String,
     /// Y Scale 输入框文本
     y_scale_buffer: String,
-    /// Y Offset 输入框是否获得焦点
-    y_offset_editing: bool,
-    /// Y Scale 输入框是否获得焦点
-    y_scale_editing: bool,
     /// Remark 输入框文本
     remark_buffer: String,
 }
@@ -119,8 +115,6 @@ impl WatchPanel {
                     refresh_buffer: String::new(),
                     y_offset_buffer: String::new(),
                     y_scale_buffer: String::new(),
-                    y_offset_editing: false,
-                    y_scale_editing: false,
                     remark_buffer: String::new(),
                 }
             })
@@ -186,8 +180,6 @@ impl WatchPanel {
         let header_bg = egui::Color32::from_rgb(238, 240, 244);
         let stripe_bg = egui::Color32::from_rgb(249, 250, 251);
         let text_dark = egui::Color32::from_rgb(45, 48, 55);
-        let text_blue = egui::Color32::from_rgb(70, 130, 200);
-        let text_amber = egui::Color32::from_rgb(170, 110, 30);
 
         // 收集本帧产生的写入请求
         let mut new_writes: Vec<WriteRequest> = Vec::new();
@@ -593,8 +585,6 @@ mod tests {
             refresh_buffer: String::new(),
             y_offset_buffer: String::new(),
             y_scale_buffer: String::new(),
-            y_offset_editing: false,
-            y_scale_editing: false,
             remark_buffer: String::new(),
         }
     }
