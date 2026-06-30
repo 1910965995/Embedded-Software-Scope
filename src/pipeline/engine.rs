@@ -245,6 +245,9 @@ impl PipelineEngine {
             .name("dap-collect".into())
             .spawn(move || {
                 let mut buf = vec![0u8; 4096];
+                // carry-over buffer：保存上次读取的不完整响应尾部，
+                // 下次读取时拼接到开头再解析，避免解析错位。
+                let mut carry: Vec<u8> = Vec::new();
                 let mut seq: u64 = 0;
 
                 // 每个 DAP_Transfer 响应的固定长度：
@@ -265,11 +268,18 @@ impl PipelineEngine {
                         }
                     };
 
+                    // 拼接 carry + 本次读取的数据到一个连续缓冲区
+                    // （carry 通常为空或仅几字节，分配开销可忽略）
+                    let mut data: Vec<u8> = Vec::with_capacity(carry.len() + n);
+                    data.extend_from_slice(&carry);
+                    data.extend_from_slice(&buf[..n]);
+                    carry.clear();
+
                     // 一次 read_bulk 可能读到多个响应（USB Bulk 合并短包），
-                    // 按 resp_len 循环解析所有响应
+                    // 按 resp_len 循环解析所有完整响应
                     let mut offset = 0;
-                    while offset + resp_len <= n {
-                        let chunk = &buf[offset..offset + resp_len];
+                    while offset + resp_len <= data.len() {
+                        let chunk = &data[offset..offset + resp_len];
                         offset += resp_len;
 
                         // 解析单个响应
@@ -312,11 +322,12 @@ impl PipelineEngine {
                         seq += 1;
                     }
 
-                    // 如果剩余数据不足一个完整响应，记录警告
-                    if offset < n && n > 0 {
-                        log::warn!(
-                            "接收线程剩余 {} 字节未解析（不完整响应）",
-                            n - offset
+                    // 保存不完整的尾部到 carry，下次读取时拼接
+                    if offset < data.len() {
+                        carry.extend_from_slice(&data[offset..]);
+                        log::debug!(
+                            "接收线程保留 {} 字节不完整响应到下次解析",
+                            data.len() - offset
                         );
                     }
                 }
