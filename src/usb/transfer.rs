@@ -11,6 +11,8 @@ pub struct BulkTransfer {
     timeout: Duration,
     /// 已 claim 的 USB 接口号，释放时需要 release_interface
     interface_num: u8,
+    /// 是否已显式 release（避免 Drop 时重复释放）
+    released: bool,
 }
 
 impl BulkTransfer {
@@ -25,6 +27,7 @@ impl BulkTransfer {
             ep_in,
             timeout: Duration::from_millis(1000),
             interface_num,
+            released: false,
         };
         // 清空 USB IN 端点缓冲区中可能残留的数据
         // （流水线非阻塞写入后可能残留未读响应）
@@ -38,6 +41,10 @@ impl BulkTransfer {
     /// 必须先排空这些残留响应，否则 DAP_Disconnect 命令会被淹没，
     /// DAP-Link 固件仍处于忙状态，Keil 等工具无法重新连接。
     pub fn release(&mut self) {
+        if self.released {
+            return;
+        }
+        self.released = true;
         // 1. 排空 USB IN 端点的所有残留响应
         //    高速采样时可能有上千个未读响应堆积在缓冲区中
         let mut drain_count = 0;
@@ -139,3 +146,16 @@ impl BulkTransfer {
 // rusb::DeviceHandle 是 Send + Sync 的，所以 BulkTransfer 也可以
 unsafe impl Send for BulkTransfer {}
 unsafe impl Sync for BulkTransfer {}
+
+impl Drop for BulkTransfer {
+    /// 兜底释放：如果未显式调用 release()，Drop 时自动执行。
+    ///
+    /// 这确保即使 Arc::try_unwrap 失败（如 PipelineEngine 仍持有引用），
+    /// USB 接口也能在最后一个引用释放时被正确释放，避免 DAP-Link 卡死。
+    fn drop(&mut self) {
+        if !self.released {
+            log::warn!("BulkTransfer 未显式 release，Drop 时自动释放");
+            self.release();
+        }
+    }
+}
