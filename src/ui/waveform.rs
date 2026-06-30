@@ -36,6 +36,9 @@ pub struct WaveformPanel {
     pub cached_points: Vec<Vec<PlotPoint>>,
     /// 缓存对应的缓冲区长度（0 表示需要重建）
     pub cache_buffer_len: usize,
+    /// 通道级脏标志：仅该通道的 Y offset/scale/可见性变化时标记
+    /// rebuild_cache 仅重建脏通道，避免全量重算
+    dirty_channels: Vec<bool>,
     /// 上一帧的可视 X 范围（秒），用于动态 X 轴标签
     last_x_range: Option<f64>,
     /// 上一帧的 X 轴右边界，用于检测用户拖拽/缩放
@@ -76,6 +79,7 @@ impl WaveformPanel {
             value_types,
             cached_points: vec![Vec::new(); n],
             cache_buffer_len: 0,
+            dirty_channels: vec![true; n], // 首次全部重建
             last_x_range: None,
             last_x_max: None,
             auto_y_max_abs: 1.0,
@@ -104,8 +108,16 @@ impl WaveformPanel {
 
         // 不进行降采样: buffer 中所有原始样本点都必须被绘制,采样工具的波形必须忠实于采集数据。
 
-        // 缓存判断: 仅在新数据到达或通道可见性变化时重建
-        if has_new_data || self.cache_buffer_len != buffer.len() {
+        // 缓存判断: 在以下任一情况时重建：
+        // - 新数据到达（has_new_data）→ 全量重建
+        // - buffer 长度变化（cache_buffer_len != buffer.len()）→ 全量重建
+        // - 有脏通道（Y offset/scale/可见性变化，但无新数据）→ 仅重建脏通道
+        let has_dirty = self.dirty_channels.iter().any(|d| *d);
+        if has_new_data || self.cache_buffer_len != buffer.len() || has_dirty {
+            // 新数据或长度变化时，标记所有通道为脏（全量重建）
+            if has_new_data || self.cache_buffer_len != buffer.len() {
+                self.mark_all_dirty();
+            }
             self.rebuild_cache(buffer);
             self.cache_buffer_len = buffer.len();
         }
@@ -282,15 +294,35 @@ impl WaveformPanel {
     /// 关键不变式: **buffer 中的每个原始样本点都进入 cached_points**。
     /// 不进行任何形式的降采样、抽点或跳点 —— 采样工具的波形必须 100% 忠实于采集到的数据。
     /// 每个点按 `displayed_y = raw_f * y_scale + y_offset` 变换;Y 轴自动 fit 仍按 `raw_f.abs()`。
+    ///
+    /// 优化：仅重建脏通道（可见性/变换变化的通道），非脏通道复用已有缓存。
+    /// 调用方通过 `mark_all_dirty()` 或 `mark_channel_dirty()` 控制重建范围。
+    /// 全量重建时（所有通道脏）重新累计 Y 轴 fit 基准；仅脏通道更新时保持已有值。
     pub fn rebuild_cache(&mut self, buffer: &[Sample]) {
-        let mut y_max_abs: f64 = 0.0;
+        // 检查是否全量重建（所有通道都脏）
+        let all_dirty = self.dirty_channels.iter().all(|d| *d);
+
+        // 全量重建时重新累计 y_max_abs；仅脏通道更新时保持已有值
+        // （非脏通道的 raw_f 未变，无需重新累计）
+        let mut y_max_abs = if all_dirty { 0.0 } else { self.auto_y_max_abs };
 
         for (ch_idx, ch) in self.channels.iter().enumerate() {
+            let dirty = self.dirty_channels.get(ch_idx).copied().unwrap_or(true);
+
             if !ch.visible {
-                self.cached_points[ch_idx].clear();
+                if dirty {
+                    self.cached_points[ch_idx].clear();
+                    self.dirty_channels[ch_idx] = false;
+                }
                 continue;
             }
 
+            if !dirty {
+                // 非脏通道：复用已有缓存，无需重建
+                continue;
+            }
+
+            // 脏通道：全量重建
             let vt = self.value_types.get(ch_idx).copied().unwrap_or(ValueType::Float);
             let scale = ch.y_scale as f64;
             let offset = ch.y_offset as f64;
@@ -312,19 +344,36 @@ impl WaveformPanel {
             }
 
             self.cached_points[ch_idx] = out;
+            self.dirty_channels[ch_idx] = false;
         }
 
         // Y 轴自适应: 仍按 raw_f,不被 offset/scale 推偏
-        self.auto_y_max_abs = if y_max_abs > 0.0 { y_max_abs } else { 1.0 };
+        if all_dirty {
+            self.auto_y_max_abs = if y_max_abs > 0.0 { y_max_abs } else { 1.0 };
+        }
+    }
+
+    /// 标记指定通道为脏（需要重建缓存）
+    fn mark_channel_dirty(&mut self, index: usize) {
+        if index < self.dirty_channels.len() {
+            self.dirty_channels[index] = true;
+        }
+    }
+
+    /// 标记所有通道为脏（全量重建）
+    fn mark_all_dirty(&mut self) {
+        self.cache_buffer_len = 0;
+        for d in self.dirty_channels.iter_mut() {
+            *d = true;
+        }
     }
 
     /// 切换通道可见性
     pub fn toggle_channel(&mut self, index: usize) {
         if let Some(ch) = self.channels.get_mut(index) {
             ch.visible = !ch.visible;
+            self.mark_channel_dirty(index);
         }
-        // 通道可见性变化时强制重建缓存
-        self.cache_buffer_len = 0;
     }
 
     /// 查询通道可见性
@@ -337,7 +386,7 @@ impl WaveformPanel {
         if let Some(ch) = self.channels.get_mut(index) {
             if ch.visible != visible {
                 ch.visible = visible;
-                self.cache_buffer_len = 0; // 强制重建缓存
+                self.mark_channel_dirty(index);
             }
         }
     }
@@ -362,7 +411,7 @@ impl WaveformPanel {
     /// 更新采样间隔（采样率变化时调用）
     pub fn set_interval(&mut self, interval_us: f64) {
         self.interval_us = interval_us;
-        self.cache_buffer_len = 0; // 强制重建缓存
+        self.mark_all_dirty();
         self.last_x_max = None; // 重置拖拽检测
     }
 
@@ -382,13 +431,13 @@ impl WaveformPanel {
         self.display_mode
     }
 
-    /// 设置单个通道的 y_offset / y_scale,并标记缓存需要重建。
+    /// 设置单个通道的 y_offset / y_scale,并标记该通道缓存需要重建。
     /// 若通道不存在(name 不匹配),该调用为 no-op。
     pub fn set_channel_transform(&mut self, name: &str, offset: f32, scale: f32) {
-        if let Some(ch) = self.channels.iter_mut().find(|c| c.name == name) {
-            ch.y_offset = offset;
-            ch.y_scale = scale;
-            self.cache_buffer_len = 0; // 强制下次 show() 重建缓存
+        if let Some(idx) = self.channels.iter().position(|c| c.name == name) {
+            self.channels[idx].y_offset = offset;
+            self.channels[idx].y_scale = scale;
+            self.mark_channel_dirty(idx);
         }
     }
 }
@@ -446,12 +495,11 @@ mod tests {
         let mut panel = make_panel(vec![("CH1", 0.0, 1.0)]);
         let buffer = make_buffer(1, &[1.0f32.to_bits()]);
         panel.rebuild_cache(&buffer);
-        // 让 cache_buffer_len 与 buffer 同步,表示"未脏"
-        panel.cache_buffer_len = buffer.len();
-        assert_eq!(panel.cache_buffer_len, buffer.len());
-        // 触发 transform 变化 → 应标记为脏
+        // rebuild_cache 后所有脏标志应被清除
+        assert!(panel.dirty_channels.iter().all(|d| !d));
+        // 触发 transform 变化 → 应标记该通道为脏
         panel.set_channel_transform("CH1", 5.0, 1.0);
-        assert_eq!(panel.cache_buffer_len, 0);
+        assert!(panel.dirty_channels[0]);
     }
 
     #[test]
