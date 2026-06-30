@@ -98,7 +98,6 @@ impl WaveformPanel {
         ui: &mut egui::Ui,
         buffer: &[Sample],
         buffer_offset: u64,
-        visible_width: f32,
         has_new_data: bool,
     ) -> Option<u64> {
         if buffer.is_empty() {

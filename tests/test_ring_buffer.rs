@@ -69,6 +69,7 @@ fn pop_empty_returns_zero() {
 #[test]
 fn pop_batch_with_small_buf() {
     let rb = RingBuffer::new(8);
+    // 缓冲区容量 8，push 10 个：后 2 个被丢弃（满时丢弃新数据）
     for i in 0..10 {
         rb.push(make_sample(i, i as u32));
     }
@@ -76,8 +77,8 @@ fn pop_batch_with_small_buf() {
     let mut buf = vec![make_sample(0, 0); 3];
     let n = rb.pop_batch(&mut buf);
     assert_eq!(n, 3); // only room for 3
-    // Remaining available
-    assert_eq!(rb.available(), 7);
+    // Remaining available: 8 written - 3 popped = 5
+    assert_eq!(rb.available(), 5);
 }
 
 // ================================================================
@@ -85,7 +86,7 @@ fn pop_batch_with_small_buf() {
 // ================================================================
 
 #[test]
-fn wrap_around_overwrites_oldest() {
+fn wrap_around_discards_new_when_full() {
     let rb = RingBuffer::new(4); // tiny capacity
 
     // Fill buffer: seq 0,1,2,3
@@ -93,7 +94,7 @@ fn wrap_around_overwrites_oldest() {
         rb.push(make_sample(i, i as u32));
     }
 
-    // Buffer is full. Push two more — overwrites oldest.
+    // Buffer is full. Push two more — 新数据被丢弃（保持 head-tail 不变量）
     rb.push(make_sample(4, 100));
     rb.push(make_sample(5, 200));
 
@@ -103,11 +104,11 @@ fn wrap_around_overwrites_oldest() {
     let mut buf = vec![make_sample(0, 0); 8];
     let n = rb.pop_batch(&mut buf);
 
-    // We get exactly capacity items (the last 4 pushed: seq 2,3,4,5)
+    // 保留的是最早写入的 4 个 (seq 0,1,2,3)，新数据 seq 4,5 已被丢弃
     assert_eq!(n, 4);
     let mut seqs: Vec<u64> = buf[..n].iter().map(|s| s.seq).collect();
     seqs.sort();
-    assert_eq!(seqs, vec![2, 3, 4, 5]);
+    assert_eq!(seqs, vec![0, 1, 2, 3]);
 }
 
 #[test]
@@ -116,7 +117,7 @@ fn available_after_wrap() {
     for i in 0..6 {
         rb.push(make_sample(i, i as u32));
     }
-    // head=6, tail=0, available=min(6, capacity)=4
+    // 满 4 后丢弃新数据：head=4, tail=0, available=min(4, capacity)=4
     assert_eq!(rb.available(), 4);
 }
 
@@ -125,12 +126,13 @@ fn available_after_wrap() {
 // ================================================================
 
 #[test]
-fn total_written_tracks_all_pushes() {
+fn total_written_tracks_successful_pushes() {
     let rb = RingBuffer::new(16);
+    // 容量 16，push 42 个：后 26 个被丢弃，total_written 只计成功写入
     for i in 0..42 {
         rb.push(make_sample(i, i as u32));
     }
-    assert_eq!(rb.total_written(), 42);
+    assert_eq!(rb.total_written(), 16);
 }
 
 #[test]
@@ -194,18 +196,18 @@ fn stress_large_volume() {
     for i in 0..10_000u64 {
         rb.push(make_sample(i, i as u32));
     }
-    // Only last 1024 are available (wrapped)
+    // 满时丢弃新数据：只有前 1024 个成功写入，后 8976 个被丢弃
     assert_eq!(rb.available(), 1024);
-    assert_eq!(rb.total_written(), 10_000);
+    assert_eq!(rb.total_written(), 1024);
 
     let mut buf = vec![make_sample(0, 0); 1024];
     let n = rb.pop_batch(&mut buf);
     assert_eq!(n, 1024);
 
-    // All values should be in range [10_000-1024, 9999]
+    // 保留的是最早写入的 [0, 1024) 区间
     let mut found: Vec<u32> = buf[..n].iter().map(|s| s.values[0]).collect();
     found.sort();
-    let expected: Vec<u32> = ((10_000u32 - 1024)..10_000).collect();
+    let expected: Vec<u32> = (0u32..1024).collect();
     assert_eq!(found, expected);
 }
 

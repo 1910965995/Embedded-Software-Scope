@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -19,6 +19,18 @@ use super::ring_buffer::RingBuffer;
 /// 典型 packet_size (512/1024)。同时避免 total_requests as u8 截断。
 const MAX_TRANSFER_REQUESTS: usize = 64;
 
+/// DAP-Link 在途请求深度上限（流控阈值）
+///
+/// 限制"已提交但未收到响应"的请求数，防止 DAP-Link 内部队列堆积。
+/// 堆积会导致 DAP-Link 快速连续处理多个请求（SWD 读取时刻接近），
+/// 但 USB 传输仍按节奏返回响应，接收时刻无法反映真实采样时刻，
+/// 在正弦波上产生"平直线伪影"。
+///
+/// 阈值 2 = 允许 1 个在 USB 传输中 + 1 个在 DAP-Link 处理中。
+/// 正常情况下不会触发等待；仅在 DAP-Link 处理慢于提交节奏时生效，
+/// 自动降低实际采样率以避免堆积。
+const MAX_INFLIGHT: u64 = 2;
+
 /// 流水线采集引擎
 ///
 /// 双线程模型：
@@ -35,6 +47,8 @@ pub struct PipelineEngine {
     /// 写入请求队列（主线程推送，提交线程消费）
     /// 元素: (地址, 数据)
     write_queue: Arc<Mutex<VecDeque<(u32, u32)>>>,
+    /// 接收线程已处理的 seq（流控用，提交线程读取以限制在途深度）
+    collect_seq: Arc<AtomicU64>,
 }
 
 impl PipelineEngine {
@@ -57,6 +71,7 @@ impl PipelineEngine {
             interval_us,
             running: Arc::new(AtomicBool::new(true)),
             write_queue: Arc::new(Mutex::new(VecDeque::new())),
+            collect_seq: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -71,6 +86,7 @@ impl PipelineEngine {
             interval_us: (1_000_000.0 / rate_hz as f64) as u64,
             running: Arc::new(AtomicBool::new(true)),
             write_queue: Arc::clone(&self.write_queue),
+            collect_seq: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -80,17 +96,24 @@ impl PipelineEngine {
     pub fn start(&self) -> Result<PipelineHandle> {
         // 重置停止标志（上一次 stop 可能已将其置为 false）
         self.running.store(true, Ordering::SeqCst);
+        // 重置接收 seq（流控起点）
+        self.collect_seq.store(0, Ordering::SeqCst);
 
         let ring = Arc::new(RingBuffer::new(200_000)); // 10秒 @ 20kHz
         let start_time = Instant::now();
 
-        // 时间戳完全由接收线程的 seq 计算：
-        //   timestamp = seq * interval_us / 1_000_000
-        // 这是理想网格时间戳，不受 USB 写入/响应抖动影响，
-        // 保证显示的采样间隔严格一致。无需跨线程队列传递。
+        // 时间戳由接收线程记录每个响应的到达时刻（Instant::now()）：
+        //   timestamp = (now - start_time).as_secs_f64()
+        // 这反映真实接收时刻，避免 DAP-Link 批量处理堆积请求时，
+        // 多个实际采样时刻接近的响应被赋予相隔 interval 的理想网格
+        // 时间戳，从而在正弦波上产生平直线伪影。
+        //
+        // 配合流控（MAX_INFLIGHT）：提交线程限制在途请求深度，从源头
+        // 避免 DAP-Link 队列堆积，使每个请求的 SWD 读取时刻更接近
+        // 理想网格，接收时刻也更准确。
 
         let submit = self.spawn_submit_thread(start_time)?;
-        let collect = self.spawn_collect_thread(Arc::clone(&ring))?;
+        let collect = self.spawn_collect_thread(Arc::clone(&ring), start_time)?;
 
         Ok(PipelineHandle {
             submit_handle: submit,
@@ -111,6 +134,7 @@ impl PipelineEngine {
         let addresses = self.addresses.clone();
         let running = Arc::clone(&self.running);
         let write_queue = Arc::clone(&self.write_queue);
+        let collect_seq = Arc::clone(&self.collect_seq);
 
         // 预构建 TransferRequest 数组（每次采样都一样）
         // 每变量 = 写 TAR + 读 DRW，共 2 条请求
@@ -133,6 +157,23 @@ impl PipelineEngine {
                 let start = start_time;
 
                 while running.load(Ordering::Relaxed) {
+                    // --- 流控：限制 DAP-Link 在途请求深度 ---
+                    // 等待接收线程处理足够多的响应，避免 DAP-Link 内部队列堆积。
+                    // 堆积会导致 DAP-Link 快速连续处理多个请求（SWD 读取时刻接近），
+                    // 而 USB 传输仍按节奏返回，接收时刻无法反映真实采样时刻，
+                    // 在正弦波上产生"平直线伪影"。
+                    while running.load(Ordering::Relaxed) {
+                        let in_flight = seq.saturating_sub(collect_seq.load(Ordering::Acquire));
+                        if in_flight < MAX_INFLIGHT {
+                            break;
+                        }
+                        // 在途深度超限，短暂等待接收线程消费
+                        spin_sleep::sleep(Duration::from_micros(10));
+                    }
+                    if !running.load(Ordering::Relaxed) {
+                        break;
+                    }
+
                     // --- 构造 DAP_Transfer 命令 ---
                     // 检查是否有待写入的请求，有则附加到命令前部。
                     // 限制每轮消耗的写入数，确保 total_requests 不超过
@@ -217,12 +258,13 @@ impl PipelineEngine {
     fn spawn_collect_thread(
         &self,
         ring: Arc<RingBuffer>,
+        start_time: Instant,
     ) -> Result<JoinHandle<()>> {
         let usb = Arc::clone(&self.usb);
         let running = Arc::clone(&self.running);
         let addresses = self.addresses.clone();
         let num_vars = addresses.len();
-        let interval_us = self.interval_us;
+        let collect_seq = Arc::clone(&self.collect_seq);
 
         let handle = thread::Builder::new()
             .name("dap-collect".into())
@@ -281,12 +323,15 @@ impl PipelineEngine {
                                 seq, resp.status, resp.count
                             );
                             seq += 1;
+                            collect_seq.store(seq, Ordering::Release);
                             continue;
                         }
 
-                        // 时间戳完全由 seq 计算（理想网格时间戳），
-                        // 不受 USB 写入/响应抖动影响，保证显示间隔严格一致。
-                        let timestamp_sec = (interval_us * seq) as f64 / 1_000_000.0;
+                        // 时间戳使用响应到达时刻，反映真实接收时间。
+                        // 当 DAP-Link 批量处理堆积请求时，多个实际采样时刻
+                        // 接近的响应会获得接近的时间戳，显示为重叠点而非
+                        // 相隔 interval 的平直线，避免正弦波伪影。
+                        let timestamp_sec = (Instant::now() - start_time).as_secs_f64();
 
                         let sample = Sample {
                             seq,
@@ -296,6 +341,7 @@ impl PipelineEngine {
 
                         ring.push(sample);
                         seq += 1;
+                        collect_seq.store(seq, Ordering::Release);
                     }
 
                     // 保存不完整的尾部到 carry，下次读取时拼接

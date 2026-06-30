@@ -209,24 +209,24 @@ fn stress_ring_buffer_200k() {
         rb.push(Sample { seq: i, timestamp_sec: i as f64 * 0.00005, values: vec![i as u32] });
     }
 
-    // After overwriting: only the last capacity items are retained (non-monotonic due to wrap)
+    // 当前行为（commit b0d76c0 后）：缓冲区满时丢弃新数据，保持 head - tail <= capacity
+    // 前 200_000 个样本成功写入，后 100_000 个被丢弃
     assert_eq!(rb.available(), 200_000);
-    assert_eq!(rb.total_written(), 300_000);
+    assert_eq!(rb.total_written(), 200_000);
 
     // Pop all available
     let mut buf = vec![Sample { seq: 0, timestamp_sec: 0.0, values: vec![] }; 200_000];
     let n = rb.pop_batch(&mut buf);
     assert_eq!(n, 200_000);
 
-    // All values should be in range [100_000, 299_999]
+    // 保留的是最早写入的 [0, 200_000) 区间（新数据被丢弃）
     for sample in &buf[..n] {
-        assert!(sample.values[0] >= 100_000, "value {} too old", sample.values[0]);
-        assert!(sample.values[0] <= 299_999, "value {} too new", sample.values[0]);
+        assert!(sample.values[0] < 200_000, "value {} too new (should have been discarded)", sample.values[0]);
     }
 
-    // Should contain exactly the expected set of values (order may vary due to wrap)
+    // Should contain exactly the expected set of values [0, 200_000)
     let mut found: Vec<u32> = buf[..n].iter().map(|s| s.values[0]).collect();
     found.sort();
-    let expected: Vec<u32> = (100_000u32..300_000).collect();
+    let expected: Vec<u32> = (0u32..200_000).collect();
     assert_eq!(found, expected);
 }

@@ -39,11 +39,18 @@ impl ElfParser {
         let path = path.as_ref();
         let data = fs::read(path).map_err(|e| format!("无法读取文件: {}", e))?;
 
-        // 先尝试 ELF32，失败再尝试 ELF64
-        if object::read::elf::ElfFile32::<object::Endianness>::parse(&data).is_ok() {
-            Self::load_elf32(path, &data)
+        // 通过 ELF header 的 class 字段判断 32/64 位，避免重复 parse
+        // ELF header 前 5 字节: magic(4) + class(1)，class=1 为 32 位，class=2 为 64 位
+        let is_64 = if data.len() >= 5 {
+            data[4] == 2 // ELFCLASS64
         } else {
+            return Err("文件过短，不是有效的 ELF 文件".to_string());
+        };
+
+        if is_64 {
             Self::load_elf64(path, &data)
+        } else {
+            Self::load_elf32(path, &data)
         }
     }
 
@@ -81,7 +88,7 @@ impl ElfParser {
 
     fn resolve_variables(
         elf_symbols: &[ElfSymbolRaw],
-        sections: &HashMap<String, Vec<u8>>,
+        sections: &HashMap<&str, &[u8]>,
     ) -> Result<Vec<ElfVariable>, String> {
         let dwarf_result = if let (Some(info), Some(abbrev)) =
             (sections.get(".debug_info"), sections.get(".debug_abbrev"))
@@ -89,12 +96,12 @@ impl ElfParser {
             let dr = dwarf::parse_dwarf_sections(
                 info,
                 abbrev,
-                sections.get(".debug_str").map(|v| v.as_slice()).unwrap_or(&[]),
-                sections.get(".debug_str_offsets").map(|v| v.as_slice()).unwrap_or(&[]),
-                sections.get(".debug_line").map(|v| v.as_slice()).unwrap_or(&[]),
-                sections.get(".debug_ranges").map(|v| v.as_slice()).unwrap_or(&[]),
-                sections.get(".debug_rnglists").map(|v| v.as_slice()).unwrap_or(&[]),
-                sections.get(".debug_addr").map(|v| v.as_slice()).unwrap_or(&[]),
+                sections.get(".debug_str").copied().unwrap_or(&[]),
+                sections.get(".debug_str_offsets").copied().unwrap_or(&[]),
+                sections.get(".debug_line").copied().unwrap_or(&[]),
+                sections.get(".debug_ranges").copied().unwrap_or(&[]),
+                sections.get(".debug_rnglists").copied().unwrap_or(&[]),
+                sections.get(".debug_addr").copied().unwrap_or(&[]),
             )?;
             log::info!(
                 "DWARF 解析: {} 个变量, {} 个类型定义, {} 个源文件",
@@ -161,15 +168,15 @@ impl ElfParser {
         Ok(symbols)
     }
 
-    /// 提取 DWARF 相关 section 的原始字节
-    fn extract_dwarf_sections<Elf: object::read::elf::FileHeader>(
-        elf: &object::read::elf::ElfFile<Elf>,
-    ) -> Result<HashMap<String, Vec<u8>>, String> {
+    /// 提取 DWARF 相关 section 的原始字节（零拷贝，借用 elf 对象）
+    fn extract_dwarf_sections<'elf, Elf: object::read::elf::FileHeader>(
+        elf: &'elf object::read::elf::ElfFile<Elf>,
+    ) -> Result<HashMap<&'elf str, &'elf [u8]>, String> {
         use object::Object;
         use object::ObjectSection;
 
         let mut sections = HashMap::new();
-        let target_sections = [
+        let target_sections: &[&str] = &[
             ".debug_info", ".debug_abbrev", ".debug_str",
             ".debug_str_offsets", ".debug_line",
             ".debug_ranges", ".debug_rnglists",
@@ -180,7 +187,7 @@ impl ElfParser {
             if let Ok(name) = section.name() {
                 if target_sections.contains(&name) {
                     if let Ok(data) = section.data() {
-                        sections.insert(name.to_string(), data.to_vec());
+                        sections.insert(name, data);
                     }
                 }
             }

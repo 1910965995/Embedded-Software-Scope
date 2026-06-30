@@ -20,7 +20,7 @@ fn make_sample(seq: u64, val: f32) -> Sample {
 fn watch_sync_default_transform() {
     // 新建 watch 面板并 sync → y_offset=0, y_scale=1
     let mut wp = WatchPanel::new();
-    wp.sync_from_channels(&["CH1".to_string()], &[ValueType::Float]);
+    wp.sync_from_channels(&["CH1".to_string()], &[ValueType::Float], &[0x20000000]);
     assert!((wp.entries[0].y_offset - 0.0).abs() < 1e-6);
     assert!((wp.entries[0].y_scale - 1.0).abs() < 1e-6);
 }
@@ -29,7 +29,7 @@ fn watch_sync_default_transform() {
 fn transform_end_to_end_through_waveform() {
     // 1) 构造 watch + waveform,共用同一个通道名
     let mut wp = WatchPanel::new();
-    wp.sync_from_channels(&["CH1".to_string()], &[ValueType::Float]);
+    wp.sync_from_channels(&["CH1".to_string()], &[ValueType::Float], &[0x20000000]);
     let mut wfp = WaveformPanel::new(
         vec!["CH1".to_string()],
         vec![egui::Color32::RED],

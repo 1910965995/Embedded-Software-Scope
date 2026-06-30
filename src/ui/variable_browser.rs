@@ -7,6 +7,13 @@ pub struct VariableBrowser {
     search_text: String,
     /// 已勾选的变量路径（与通道面板联动）
     pub checked_paths: HashSet<String>,
+    /// 缓存的上次搜索文字（用于检测变化）
+    cached_search: String,
+    /// 缓存的过滤结果（变量在 ctx.variables 中的索引）
+    /// 仅在 search_text 变化时重建
+    cached_filtered: Vec<usize>,
+    /// 缓存对应的 ELF 文件路径（ELF 重新加载时重建）
+    cached_elf_path: String,
 }
 
 impl VariableBrowser {
@@ -14,6 +21,9 @@ impl VariableBrowser {
         Self {
             search_text: String::new(),
             checked_paths: HashSet::new(),
+            cached_search: String::new(),
+            cached_filtered: Vec::new(),
+            cached_elf_path: String::new(),
         }
     }
 
@@ -47,19 +57,37 @@ impl VariableBrowser {
 
         ui.separator();
 
-        // 构建过滤后的显示列表（仅按变量名搜索）
-        let filtered: Vec<&ElfVariable> = if self.search_text.is_empty() {
-            ctx.variables.iter().collect()
-        } else {
-            let lower = self.search_text.to_lowercase();
-            ctx.variables
-                .iter()
-                .filter(|v| {
-                    v.name.to_lowercase().contains(&lower)
+        // 检测是否需要重建过滤缓存（搜索文字变化或 ELF 重新加载）
+        let elf_path = ctx.file_path.clone();
+        let need_rebuild = self.search_text != self.cached_search
+            || elf_path != self.cached_elf_path;
+
+        if need_rebuild {
+            self.cached_search = self.search_text.clone();
+            self.cached_elf_path = elf_path;
+            self.cached_filtered.clear();
+
+            if self.search_text.is_empty() {
+                // 空搜索：包含所有变量
+                self.cached_filtered.extend(0..ctx.variables.len());
+            } else {
+                let lower = self.search_text.to_lowercase();
+                for (i, v) in ctx.variables.iter().enumerate() {
+                    if v.name.to_lowercase().contains(&lower)
                         || v.path.to_lowercase().contains(&lower)
-                })
-                .collect()
-        };
+                    {
+                        self.cached_filtered.push(i);
+                    }
+                }
+            }
+        }
+
+        // 从缓存构建显示列表（仅借用，无重新过滤）
+        let filtered: Vec<&ElfVariable> = self
+            .cached_filtered
+            .iter()
+            .map(|&i| &ctx.variables[i])
+            .collect();
 
         // 按 source_file 分组显示，ScrollArea 限制最大高度
         egui::ScrollArea::vertical()
@@ -72,14 +100,14 @@ impl VariableBrowser {
                 for var in &filtered {
                     let group = var
                         .source_file
-                        .clone()
-                        .unwrap_or_else(|| "Globals".to_string());
+                        .as_deref()
+                        .unwrap_or("Globals");
 
-                    if current_group.as_deref() != Some(&group) {
-                        current_group = Some(group.clone());
+                    if current_group.as_deref() != Some(group) {
+                        current_group = Some(group.to_string());
                         ui.add_space(4.0);
                         ui.label(
-                            egui::RichText::new(&group)
+                            egui::RichText::new(group)
                                 .small()
                                 .color(egui::Color32::from_rgb(110, 118, 129)),
                         );

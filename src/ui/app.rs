@@ -713,13 +713,11 @@ impl eframe::App for DapSamplerApp {
             ui.separator();
 
             // 波形
-            let available_width = ui.available_width();
             let buffer_offset = self.display_buf.oldest_seq();
             if let Some(seq) = self.waveform.show(
                 ui,
                 self.display_buf.all(),
                 buffer_offset,
-                available_width,
                 has_new_data,
             ) {
                 self.cursor.click(seq);
