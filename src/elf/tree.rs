@@ -57,11 +57,15 @@ pub fn build_from_dwarf(
         valid_dwarf_vars.len(), result.len(), skipped
     );
 
-    // 3. 去重（同名同地址的变量只保留一个）
-    result.dedup_by(|a, b| a.path == b.path && a.address == b.address);
+    // 3. 先按 (path, address) 排序，使相同条目相邻
+    //    （dedup_by 仅移除相邻重复，必须先 sort 再 dedup）
+    result.sort_by(|a, b| {
+        a.path.cmp(&b.path)
+            .then_with(|| a.address.cmp(&b.address))
+    });
 
-    // 4. 按 path 排序
-    result.sort_by(|a, b| a.path.cmp(&b.path));
+    // 4. 去重（同名同地址的变量只保留一个）
+    result.dedup_by(|a, b| a.path == b.path && a.address == b.address);
     Ok(result)
 }
 
