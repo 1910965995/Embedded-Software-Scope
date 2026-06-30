@@ -38,12 +38,26 @@ impl RingBuffer {
 
     /// 写入一个采样点（接收线程调用）
     ///
-    /// 永远不会阻塞。如果缓冲区满（消费者跟不上），覆盖最旧数据。
+    /// 永远不会阻塞。如果缓冲区满（消费者跟不上），**丢弃新数据**。
+    ///
+    /// # Safety
+    /// 保持 SPSC 模型不变量 `head - tail <= capacity`：
+    /// - 满时（`head - tail == capacity`）不写入，避免与消费者读取的
+    ///   `tail % capacity` 槽位发生重叠（否则会触发 `Option<Sample>` 的
+    ///   torn read / use-after-free，因为 `Option<Vec<u32>>` 赋值非原子）。
     pub fn push(&self, sample: Sample) {
         let h = self.head.load(Ordering::Relaxed);
+        let t = self.tail.load(Ordering::Acquire);
+        // 已写入但未读取的数量 = head - tail
+        let in_use = h.wrapping_sub(t);
+        if in_use >= self.capacity {
+            // 缓冲区满：丢弃新数据，保持不变量 head - tail <= capacity
+            // （消费者跟不上时主动丢点优于数据竞争导致崩溃）
+            return;
+        }
         let idx = h % self.capacity;
-        // SAFETY: 只有接收线程调用 push，且写入位置由 head 原子变量保证
-        // 不与 pop_batch 的读取位置重叠（head > tail 的区间由消费者独享）
+        // SAFETY: 只有接收线程调用 push，写入位置 [tail, head) 与
+        // pop_batch 的读取范围 [tail, head) 由 head/tail 原子变量协调
         unsafe {
             let data = &mut *self.data.get();
             data[idx] = Some(sample);
