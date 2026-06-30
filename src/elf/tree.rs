@@ -5,6 +5,7 @@ use super::parser::{ElfSymbolRaw, ElfVariable};
 use crate::pipeline::sample::ValueType;
 
 /// 解析后的类型（沿 typedef/const/volatile 链找到最终类型）
+#[derive(Clone)]
 enum ResolvedType {
     Base(String, u32),
     Struct(u64),
@@ -38,10 +39,13 @@ pub fn build_from_dwarf(
     }
 
     // 2. 对每个变量，解析类型链并展开
+    //    使用 HashMap 缓存已解析的类型，避免相同 type_offset 重复解析
+    //    （大型固件中数百变量共享同一类型如 uint32_t、float）
+    let mut type_cache: HashMap<u64, ResolvedType> = HashMap::new();
     let mut result = Vec::new();
     let mut skipped = 0usize;
     for dv in &valid_dwarf_vars {
-        let resolved = resolve_type(dv.type_offset, &dwarf.types);
+        let resolved = resolve_type_cached(dv.type_offset, &dwarf.types, &mut type_cache);
         let before = result.len();
         expand_variable(dv, &resolved, &dwarf.types, "", &mut result);
         if result.len() == before {
@@ -129,6 +133,24 @@ fn resolve_type(offset: u64, types: &HashMap<u64, DwarfTypeInfo>) -> ResolvedTyp
             }
         }
     }
+}
+
+/// 带缓存的类型解析
+///
+/// 相同 type_offset 只解析一次，后续直接从缓存返回。
+/// 大型固件中数百变量共享同一类型（如 uint32_t、float），
+/// 缓存可避免数十甚至数百次重复遍历类型链。
+fn resolve_type_cached(
+    offset: u64,
+    types: &HashMap<u64, DwarfTypeInfo>,
+    cache: &mut HashMap<u64, ResolvedType>,
+) -> ResolvedType {
+    if let Some(cached) = cache.get(&offset) {
+        return cached.clone();
+    }
+    let resolved = resolve_type(offset, types);
+    cache.insert(offset, resolved.clone());
+    resolved
 }
 
 /// 将变量展开为叶子条目
